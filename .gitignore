@@ -1,0 +1,53 @@
+# ==========================================
+# System Files
+# ==========================================
+.DS_Store
+Thumbs.db
+.claude/
+
+# ==========================================
+# Frontend (Next.js & Node.js)
+# ==========================================
+# Dependencies (Massive folders fetched via npm)
+node_modules/
+
+# Next.js build outputs
+.next/
+out/
+dist/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local environment variables (will contain secret API keys later)
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ==========================================
+# Backend (Python & FastAPI)
+# ==========================================
+# Environments (Your local python packages)
+venv/
+.venv/
+env/
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Backend local environments
+backend/.env
+
+# ==========================================
+# Project Specific Custom Uploads
+# ==========================================
+backend/uploads/*
+!backend/uploads/.gitkeep
