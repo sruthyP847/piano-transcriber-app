@@ -1,6 +1,8 @@
 import uuid
 from pathlib import Path
 
+import librosa
+import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +23,22 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 app.mount("/api/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 ALLOWED_CONTENT_TYPES = {"video/mp4", "video/quicktime", "video/x-m4v"}
+
+
+def analyze_audio(audio_path: Path) -> dict:
+    # sr=None preserves the file's native sample rate instead of resampling to 22.05kHz.
+    waveform, sample_rate = librosa.load(str(audio_path), sr=None)
+    duration_seconds = librosa.get_duration(y=waveform, sr=sample_rate)
+    tempo, _ = librosa.beat.beat_track(y=waveform, sr=sample_rate)
+
+    # librosa returns tempo as a 1-element array rather than a bare scalar.
+    tempo_bpm = float(np.asarray(tempo).reshape(-1)[0])
+
+    return {
+        "duration_seconds": round(float(duration_seconds), 3),
+        "sample_rate": int(sample_rate),
+        "tempo_bpm": round(tempo_bpm, 1),
+    }
 
 
 @app.get("/api/hello")
@@ -73,6 +91,8 @@ async def transcribe(file: UploadFile):
         if video_clip is not None:
             video_clip.close()
 
+    audio_analysis = analyze_audio(audio_destination)
+
     return {
         "status": "success",
         "message": "File ingested and audio extracted successfully.",
@@ -81,4 +101,5 @@ async def transcribe(file: UploadFile):
         "audio_filename": audio_filename,
         "size_bytes": size_bytes,
         "content_type": file.content_type,
+        **audio_analysis,
     }
