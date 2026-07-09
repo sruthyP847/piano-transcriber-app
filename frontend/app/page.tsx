@@ -5,13 +5,14 @@ import { useCallback, useRef, useState } from "react";
 type Status = "idle" | "uploading" | "processing" | "success" | "error";
 
 const ACCEPTED_TYPES = ["video/mp4", "video/quicktime", "video/x-m4v"];
+const API_BASE = "http://localhost:8000";
 
 export default function Home() {
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState(0);
   const [fileName, setFileName] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [resultMessage, setResultMessage] = useState<string | null>(null);
+  const [savedFilename, setSavedFilename] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -21,7 +22,7 @@ export default function Home() {
     setProgress(0);
     setFileName(null);
     setErrorMessage(null);
-    setResultMessage(null);
+    setSavedFilename(null);
   };
 
   const uploadFile = useCallback(async (file: File) => {
@@ -34,7 +35,7 @@ export default function Home() {
     setStatus("uploading");
     setFileName(file.name);
     setErrorMessage(null);
-    setResultMessage(null);
+    setSavedFilename(null);
     setProgress(0);
 
     // Simulated progress while the real upload happens in the background.
@@ -51,7 +52,7 @@ export default function Home() {
       const formData = new FormData();
       formData.append("file", file);
 
-      const response = await fetch("http://localhost:8000/api/transcribe", {
+      const response = await fetch(`${API_BASE}/api/transcribe`, {
         method: "POST",
         body: formData,
       });
@@ -71,7 +72,7 @@ export default function Home() {
       // Brief pause so the "processing" state is visible before showing the result.
       setTimeout(() => {
         setStatus("success");
-        setResultMessage(data.message ?? "File ingested successfully.");
+        setSavedFilename(data.saved_as);
       }, 600);
     } catch (err) {
       if (progressIntervalRef.current) {
@@ -108,6 +109,60 @@ export default function Home() {
   );
 
   const isBusy = status === "uploading" || status === "processing";
+
+  if (status === "success" && savedFilename) {
+    const videoUrl = `${API_BASE}/api/uploads/${savedFilename}`;
+
+    return (
+      <main className="min-h-screen bg-gray-50 px-4 py-8 md:px-8">
+        <div className="mb-6 text-center">
+          <h1 className="text-3xl font-bold text-gray-900">Piano Transcriber</h1>
+          <p className="mt-2 text-gray-500">{fileName}</p>
+        </div>
+
+        <div className="mx-auto flex max-w-7xl flex-col gap-6 md:flex-row">
+          {/* Left: video player, 60% */}
+          <div className="md:w-[60%]">
+            <div className="overflow-hidden rounded-2xl bg-black shadow-lg">
+              <video
+                key={videoUrl}
+                src={videoUrl}
+                controls
+                className="aspect-video w-full"
+              />
+            </div>
+          </div>
+
+          {/* Right: transcription dashboard, 40% */}
+          <div className="md:w-[40%]">
+            <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
+              <h2 className="text-lg font-semibold text-gray-900">
+                Piano Transcription Feed
+              </h2>
+              <p className="mt-1 text-sm text-gray-400">
+                Sheet music will appear here once processing begins.
+              </p>
+
+              <div className="mt-6 space-y-3">
+                <div className="h-4 w-3/4 animate-pulse rounded bg-gray-200" />
+                <div className="h-4 w-full animate-pulse rounded bg-gray-200" />
+                <div className="h-4 w-5/6 animate-pulse rounded bg-gray-200" />
+                <div className="h-32 w-full animate-pulse rounded-lg bg-gray-200" />
+                <div className="h-4 w-2/3 animate-pulse rounded bg-gray-200" />
+              </div>
+            </div>
+
+            <button
+              onClick={resetState}
+              className="mt-4 w-full rounded-lg border border-gray-300 bg-white py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+            >
+              Upload a New Video
+            </button>
+          </div>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-center bg-gray-50 px-4">
@@ -180,13 +235,6 @@ export default function Home() {
             </div>
           )}
 
-          {status === "success" && (
-            <>
-              <p className="text-sm font-medium text-green-600">{resultMessage}</p>
-              <p className="mt-1 truncate text-xs text-gray-400">{fileName}</p>
-            </>
-          )}
-
           {status === "error" && (
             <>
               <p className="text-sm font-medium text-red-600">{errorMessage}</p>
@@ -195,12 +243,12 @@ export default function Home() {
           )}
         </div>
 
-        {(status === "success" || status === "error") && (
+        {status === "error" && (
           <button
             onClick={resetState}
             className="mt-4 w-full rounded-lg border border-gray-300 bg-white py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
           >
-            Upload another file
+            Try again
           </button>
         )}
       </div>
