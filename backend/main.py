@@ -104,10 +104,15 @@ def analyze_audio(audio_path: Path) -> dict:
     # librosa returns tempo as a 1-element array rather than a bare scalar.
     tempo_bpm = float(np.asarray(tempo).reshape(-1)[0])
 
+    onset_frames = librosa.onset.onset_detect(y=waveform, sr=sample_rate, units="frames")
+    onset_times = librosa.frames_to_time(onset_frames, sr=sample_rate)
+    detected_onsets = [round(float(t), 2) for t in onset_times]
+
     return {
         "duration_seconds": round(float(duration_seconds), 3),
         "sample_rate": int(sample_rate),
         "tempo_bpm": round(tempo_bpm, 1),
+        "detected_onsets": detected_onsets,
     }
 
 
