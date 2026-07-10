@@ -95,6 +95,36 @@ def generate_placeholder_musicxml(musicxml_path: Path) -> None:
     musicxml_path.write_text(xml, encoding="utf-8")
 
 
+PIANO_FMIN = 65  # ~C2
+PIANO_FMAX = 2093  # ~C7
+NOTE_SLICE_SECONDS = 0.3
+YIN_MIN_SAMPLES = 512  # below this, yin has too little signal to estimate a frame
+
+
+def detect_notes(waveform: np.ndarray, sample_rate: int, onset_times: np.ndarray) -> list[str]:
+    slice_samples = int(NOTE_SLICE_SECONDS * sample_rate)
+    total_samples = len(waveform)
+    notes = []
+
+    for onset_time in onset_times:
+        start_sample = int(onset_time * sample_rate)
+        end_sample = min(start_sample + slice_samples, total_samples)
+        segment = waveform[start_sample:end_sample]
+
+        note = "Rest"
+        if len(segment) >= YIN_MIN_SAMPLES:
+            f0 = librosa.yin(segment, fmin=PIANO_FMIN, fmax=PIANO_FMAX, sr=sample_rate)
+            f0 = f0[~np.isnan(f0)]
+            if f0.size > 0:
+                median_freq = float(np.median(f0))
+                if median_freq > 0:
+                    note = librosa.hz_to_note(median_freq)
+
+        notes.append(note)
+
+    return notes
+
+
 def analyze_audio(audio_path: Path) -> dict:
     # sr=None preserves the file's native sample rate instead of resampling to 22.05kHz.
     waveform, sample_rate = librosa.load(str(audio_path), sr=None)
@@ -107,12 +137,14 @@ def analyze_audio(audio_path: Path) -> dict:
     onset_frames = librosa.onset.onset_detect(y=waveform, sr=sample_rate, units="frames")
     onset_times = librosa.frames_to_time(onset_frames, sr=sample_rate)
     detected_onsets = [round(float(t), 2) for t in onset_times]
+    detected_notes = detect_notes(waveform, sample_rate, onset_times)
 
     return {
         "duration_seconds": round(float(duration_seconds), 3),
         "sample_rate": int(sample_rate),
         "tempo_bpm": round(tempo_bpm, 1),
         "detected_onsets": detected_onsets,
+        "detected_notes": detected_notes,
     }
 
 
