@@ -23,6 +23,76 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 app.mount("/api/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 ALLOWED_CONTENT_TYPES = {"video/mp4", "video/quicktime", "video/x-m4v"}
+BASE_URL = "http://localhost:8000"
+
+
+def generate_placeholder_pdf(pdf_path: Path, title: str) -> None:
+    # Hand-rolled minimal single-page PDF (no external dependency) with a
+    # correctly computed xref table so browsers can render it directly.
+    safe_title = title.replace("(", r"\(").replace(")", r"\)")
+    stream_content = f"BT /F1 20 Tf 72 700 Td ({safe_title}) Tj ET".encode("latin-1")
+
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(stream_content)
+        + stream_content
+        + b"\nendstream",
+    ]
+
+    buffer = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(buffer))
+        buffer += f"{i} 0 obj\n".encode() + obj + b"\nendobj\n"
+
+    xref_offset = len(buffer)
+    buffer += f"xref\n0 {len(objects) + 1}\n".encode()
+    buffer += b"0000000000 65535 f \n"
+    for offset in offsets:
+        buffer += f"{offset:010d} 00000 n \n".encode()
+    buffer += (
+        b"trailer\n"
+        + f"<< /Size {len(objects) + 1} /Root 1 0 R >>\n".encode()
+        + b"startxref\n"
+        + f"{xref_offset}\n".encode()
+        + b"%%EOF"
+    )
+
+    pdf_path.write_bytes(bytes(buffer))
+
+
+def generate_placeholder_musicxml(musicxml_path: Path) -> None:
+    # Minimal valid single-measure MusicXML skeleton, standing in until the
+    # real transcription pipeline produces actual notation.
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">
+<score-partwise version="4.0">
+  <part-list>
+    <score-part id="P1">
+      <part-name>Piano</part-name>
+    </score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>1</divisions>
+        <key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>G</sign><line>2</line></clef>
+      </attributes>
+      <note>
+        <rest/>
+        <duration>4</duration>
+      </note>
+    </measure>
+  </part>
+</score-partwise>
+"""
+    musicxml_path.write_text(xml, encoding="utf-8")
 
 
 def analyze_audio(audio_path: Path) -> dict:
@@ -93,6 +163,11 @@ async def transcribe(file: UploadFile):
 
     audio_analysis = analyze_audio(audio_destination)
 
+    pdf_filename = f"{file_id}.pdf"
+    musicxml_filename = f"{file_id}.musicxml"
+    generate_placeholder_pdf(UPLOAD_DIR / pdf_filename, file.filename or "Piano Transcriber")
+    generate_placeholder_musicxml(UPLOAD_DIR / musicxml_filename)
+
     return {
         "status": "success",
         "message": "File ingested and audio extracted successfully.",
@@ -101,5 +176,7 @@ async def transcribe(file: UploadFile):
         "audio_filename": audio_filename,
         "size_bytes": size_bytes,
         "content_type": file.content_type,
+        "pdf_url": f"{BASE_URL}/api/uploads/{pdf_filename}",
+        "musicxml_url": f"{BASE_URL}/api/uploads/{musicxml_filename}",
         **audio_analysis,
     }

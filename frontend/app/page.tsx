@@ -13,6 +13,11 @@ export default function Home() {
   const [fileName, setFileName] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [savedFilename, setSavedFilename] = useState<string | null>(null);
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [musicxmlUrl, setMusicxmlUrl] = useState<string | null>(null);
+  const [durationSeconds, setDurationSeconds] = useState<number | null>(null);
+  const [sampleRate, setSampleRate] = useState<number | null>(null);
+  const [tempoBpm, setTempoBpm] = useState<number | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -23,6 +28,11 @@ export default function Home() {
     setFileName(null);
     setErrorMessage(null);
     setSavedFilename(null);
+    setPdfUrl(null);
+    setMusicxmlUrl(null);
+    setDurationSeconds(null);
+    setSampleRate(null);
+    setTempoBpm(null);
   };
 
   const uploadFile = useCallback(async (file: File) => {
@@ -36,6 +46,11 @@ export default function Home() {
     setFileName(file.name);
     setErrorMessage(null);
     setSavedFilename(null);
+    setPdfUrl(null);
+    setMusicxmlUrl(null);
+    setDurationSeconds(null);
+    setSampleRate(null);
+    setTempoBpm(null);
     setProgress(0);
 
     // Simulated progress while the real upload happens in the background.
@@ -73,6 +88,11 @@ export default function Home() {
       setTimeout(() => {
         setStatus("success");
         setSavedFilename(data.saved_as);
+        setPdfUrl(data.pdf_url);
+        setMusicxmlUrl(data.musicxml_url);
+        setDurationSeconds(data.duration_seconds);
+        setSampleRate(data.sample_rate);
+        setTempoBpm(data.tempo_bpm);
       }, 600);
     } catch (err) {
       if (progressIntervalRef.current) {
@@ -110,54 +130,98 @@ export default function Home() {
 
   const isBusy = status === "uploading" || status === "processing";
 
-  if (status === "success" && savedFilename) {
+  if (status === "success" && savedFilename && pdfUrl && musicxmlUrl) {
     const videoUrl = `${API_BASE}/api/uploads/${savedFilename}`;
 
     return (
-      <main className="min-h-screen bg-gray-50 px-4 py-8 md:px-8">
+      <main className="min-h-screen bg-gray-950 px-4 py-8 text-gray-100 md:px-8">
         <div className="mb-6 text-center">
-          <h1 className="text-3xl font-bold text-gray-900">Piano Transcriber</h1>
-          <p className="mt-2 text-gray-500">{fileName}</p>
+          <h1 className="text-3xl font-bold text-white">Piano Transcriber</h1>
+          <p className="mt-2 text-gray-400">{fileName}</p>
         </div>
 
-        <div className="mx-auto flex max-w-7xl flex-col gap-6 md:flex-row">
-          {/* Left: video player, 60% */}
-          <div className="md:w-[60%]">
-            <div className="overflow-hidden rounded-2xl bg-black shadow-lg">
-              <video
-                key={videoUrl}
-                src={videoUrl}
-                controls
-                className="aspect-video w-full"
-              />
+        <div className="mx-auto flex max-w-7xl flex-col gap-6 lg:flex-row lg:items-stretch">
+          {/* Left column: video + audio properties + downloads, 40% */}
+          <div className="flex flex-col gap-6 lg:w-[40%]">
+            <div className="overflow-hidden rounded-2xl bg-black shadow-lg shadow-black/40">
+              <video key={videoUrl} src={videoUrl} controls className="aspect-video w-full" />
             </div>
-          </div>
 
-          {/* Right: transcription dashboard, 40% */}
-          <div className="md:w-[40%]">
-            <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
-              <h2 className="text-lg font-semibold text-gray-900">
-                Piano Transcription Feed
-              </h2>
-              <p className="mt-1 text-sm text-gray-400">
-                Sheet music will appear here once processing begins.
-              </p>
+            <div className="rounded-2xl border border-gray-800 bg-gray-900 p-6 shadow-lg shadow-black/40">
+              <h2 className="text-lg font-semibold text-white">Audio Properties</h2>
 
-              <div className="mt-6 space-y-3">
-                <div className="h-4 w-3/4 animate-pulse rounded bg-gray-200" />
-                <div className="h-4 w-full animate-pulse rounded bg-gray-200" />
-                <div className="h-4 w-5/6 animate-pulse rounded bg-gray-200" />
-                <div className="h-32 w-full animate-pulse rounded-lg bg-gray-200" />
-                <div className="h-4 w-2/3 animate-pulse rounded bg-gray-200" />
+              <dl className="mt-4 grid grid-cols-3 gap-3 text-center">
+                <div className="rounded-xl bg-gray-800/60 p-3">
+                  <dt className="text-xs uppercase tracking-wide text-gray-400">Tempo</dt>
+                  <dd className="mt-1 text-xl font-semibold text-indigo-400">
+                    {tempoBpm !== null ? tempoBpm.toFixed(1) : "—"}
+                  </dd>
+                  <dd className="text-xs text-gray-500">BPM</dd>
+                </div>
+                <div className="rounded-xl bg-gray-800/60 p-3">
+                  <dt className="text-xs uppercase tracking-wide text-gray-400">Duration</dt>
+                  <dd className="mt-1 text-xl font-semibold text-indigo-400">
+                    {durationSeconds !== null ? durationSeconds.toFixed(2) : "—"}
+                  </dd>
+                  <dd className="text-xs text-gray-500">seconds</dd>
+                </div>
+                <div className="rounded-xl bg-gray-800/60 p-3">
+                  <dt className="text-xs uppercase tracking-wide text-gray-400">Sample Rate</dt>
+                  <dd className="mt-1 text-xl font-semibold text-indigo-400">
+                    {sampleRate !== null ? (sampleRate / 1000).toFixed(1) : "—"}
+                  </dd>
+                  <dd className="text-xs text-gray-500">kHz</dd>
+                </div>
+              </dl>
+
+              <div className="mt-6 flex flex-col gap-3">
+                <a
+                  href={pdfUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  download
+                  className="flex items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white shadow-md shadow-indigo-950/50 transition-colors hover:bg-indigo-500"
+                >
+                  Download Printable PDF
+                </a>
+                <a
+                  href={musicxmlUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  download
+                  className="flex items-center justify-center gap-2 rounded-xl border border-gray-700 bg-gray-800 px-4 py-3 text-sm font-semibold text-gray-100 transition-colors hover:bg-gray-700"
+                >
+                  Download MusicXML Data
+                </a>
               </div>
             </div>
 
             <button
               onClick={resetState}
-              className="mt-4 w-full rounded-lg border border-gray-300 bg-white py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+              className="rounded-lg border border-gray-700 bg-gray-900 py-2 text-sm font-medium text-gray-300 transition-colors hover:bg-gray-800"
             >
               Upload a New Video
             </button>
+          </div>
+
+          {/* Right column: PDF preview, 60% */}
+          <div className="flex flex-col lg:w-[60%]">
+            <div className="flex flex-1 flex-col rounded-2xl border border-gray-800 bg-gray-900 p-6 shadow-lg shadow-black/40">
+              <h2 className="text-lg font-semibold text-white">
+                Generated Sheet Music Preview
+              </h2>
+              <p className="mt-1 text-sm text-gray-400">
+                Rendered directly from the generated PDF.
+              </p>
+
+              <div className="mt-4 min-h-[600px] flex-1 overflow-hidden rounded-xl bg-white">
+                <iframe
+                  src={pdfUrl}
+                  title="Generated sheet music PDF preview"
+                  className="h-full min-h-[600px] w-full"
+                />
+              </div>
+            </div>
           </div>
         </div>
       </main>
