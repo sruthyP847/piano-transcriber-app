@@ -1,6 +1,7 @@
 import uuid
 from pathlib import Path
 
+import cv2
 import librosa
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile
@@ -125,7 +126,27 @@ def detect_notes(waveform: np.ndarray, sample_rate: int, onset_times: np.ndarray
     return notes
 
 
-def analyze_audio(audio_path: Path) -> dict:
+def extract_frame_at_time(video_path: Path, timestamp_seconds: float) -> np.ndarray | None:
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            return None
+
+        frame_index = int(timestamp_seconds * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+
+        success, frame = cap.read()
+        if not success or frame is None:
+            return None
+
+        return frame
+    finally:
+        # cv2.VideoCapture holds an open file handle until explicitly released.
+        cap.release()
+
+
+def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     # sr=None preserves the file's native sample rate instead of resampling to 22.05kHz.
     waveform, sample_rate = librosa.load(str(audio_path), sr=None)
     duration_seconds = librosa.get_duration(y=waveform, sr=sample_rate)
@@ -138,6 +159,15 @@ def analyze_audio(audio_path: Path) -> dict:
     onset_times = librosa.frames_to_time(onset_frames, sr=sample_rate)
     detected_onsets = [round(float(t), 2) for t in onset_times]
     detected_notes = detect_notes(waveform, sample_rate, onset_times)
+
+    # Sanity-check the audio-to-video frame targeting math against the first
+    # few onsets before it's relied on for real multimodal analysis.
+    for onset_time in detected_onsets[:3]:
+        frame = extract_frame_at_time(video_path, onset_time)
+        if frame is not None:
+            print(f"[frame check] onset={onset_time}s -> frame shape {frame.shape}")
+        else:
+            print(f"[frame check] onset={onset_time}s -> FAILED to read frame")
 
     return {
         "duration_seconds": round(float(duration_seconds), 3),
@@ -198,7 +228,7 @@ async def transcribe(file: UploadFile):
         if video_clip is not None:
             video_clip.close()
 
-    audio_analysis = analyze_audio(audio_destination)
+    audio_analysis = analyze_audio(audio_destination, destination)
 
     pdf_filename = f"{file_id}.pdf"
     musicxml_filename = f"{file_id}.musicxml"
