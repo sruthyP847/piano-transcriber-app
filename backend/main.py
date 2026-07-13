@@ -146,6 +146,10 @@ def extract_frame_at_time(video_path: Path, timestamp_seconds: float) -> np.ndar
         cap.release()
 
 
+def convert_seconds_to_beats(onset_times: list[float], tempo_bpm: float) -> list[float]:
+    return [round(timestamp * (tempo_bpm / 60.0), 2) for timestamp in onset_times]
+
+
 def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     # sr=None preserves the file's native sample rate instead of resampling to 22.05kHz.
     waveform, sample_rate = librosa.load(str(audio_path), sr=None)
@@ -158,6 +162,7 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     onset_frames = librosa.onset.onset_detect(y=waveform, sr=sample_rate, units="frames")
     onset_times = librosa.frames_to_time(onset_frames, sr=sample_rate)
     detected_onsets = [round(float(t), 2) for t in onset_times]
+    detected_beats = convert_seconds_to_beats(detected_onsets, tempo_bpm)
     detected_notes = detect_notes(waveform, sample_rate, onset_times)
 
     # Sanity-check the audio-to-video frame targeting math against the first
@@ -174,6 +179,7 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
         "sample_rate": int(sample_rate),
         "tempo_bpm": round(tempo_bpm, 1),
         "detected_onsets": detected_onsets,
+        "detected_beats": detected_beats,
         "detected_notes": detected_notes,
     }
 

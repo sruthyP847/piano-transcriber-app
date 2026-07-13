@@ -214,11 +214,11 @@ export default function Home() {
                 Rendered directly from the generated PDF.
               </p>
 
-              <div className="mt-4 min-h-[600px] flex-1 overflow-hidden rounded-xl bg-white">
+              <div className="mt-4 min-h-150 flex-1 overflow-hidden rounded-xl bg-white">
                 <iframe
                   src={pdfUrl}
                   title="Generated sheet music PDF preview"
-                  className="h-full min-h-[600px] w-full"
+                  className="h-full min-h-150 w-full"
                 />
               </div>
             </div>
