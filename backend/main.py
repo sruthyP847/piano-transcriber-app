@@ -154,6 +154,90 @@ def quantize_beats(detected_beats: list[float], resolution: float = 0.25) -> lis
     return [round(round(beat / resolution) * resolution, 2) for beat in detected_beats]
 
 
+def calculate_bar_structures(
+    quantized_beats: list[float], beats_per_bar: int = 4
+) -> tuple[list[int], list[float]]:
+    detected_bars = []
+    measure_beats = []
+
+    for beat in quantized_beats:
+        bar_number = int(beat // beats_per_bar) + 1
+        beat_in_bar = round(beat % beats_per_bar, 2)
+        detected_bars.append(bar_number)
+        measure_beats.append(beat_in_bar)
+
+    return detected_bars, measure_beats
+
+
+STANDARD_NOTE_DURATIONS = [
+    (0.25, "sixteenth"),
+    (0.50, "eighth"),
+    (1.00, "quarter"),
+    (2.00, "half"),
+    (4.00, "whole"),
+]
+
+
+def _closest_note_type(duration: float) -> str:
+    if duration <= 0:
+        return "complex"
+
+    closest_value, closest_name = min(
+        STANDARD_NOTE_DURATIONS, key=lambda item: abs(item[0] - duration)
+    )
+    # Anything within half the closest standard value's own length counts as
+    # that note type; further off doesn't cleanly fit the standard grid.
+    if abs(duration - closest_value) <= closest_value * 0.5:
+        return closest_name
+    return "complex"
+
+
+def calculate_note_durations(
+    quantized_beats: list[float], total_duration_beats: float
+) -> tuple[list[float], list[str]]:
+    note_durations = []
+    note_types = []
+
+    for i, beat in enumerate(quantized_beats):
+        if i < len(quantized_beats) - 1:
+            duration = quantized_beats[i + 1] - beat
+        else:
+            duration = total_duration_beats - beat
+
+        duration = round(duration, 2)
+        note_durations.append(duration)
+        note_types.append(_closest_note_type(duration))
+
+    return note_durations, note_types
+
+
+PITCH_MAGNITUDE_THRESHOLD = 0.1
+
+
+def detect_pitches_at_timestamps(y: np.ndarray, sr: int, timestamps: list[float]) -> list[str]:
+    detected_pitches = []
+
+    pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+    num_frames = magnitudes.shape[1]
+
+    for timestamp in timestamps:
+        frame = int(librosa.time_to_frames(timestamp, sr=sr))
+        frame = max(0, min(frame, num_frames - 1))
+
+        idx = magnitudes[:, frame].argmax()
+        frequency = pitches[idx, frame]
+        magnitude = magnitudes[idx, frame]
+
+        if frequency > 0 and magnitude > PITCH_MAGNITUDE_THRESHOLD:
+            note = librosa.hz_to_note(frequency)
+        else:
+            note = "unknown"
+
+        detected_pitches.append(note)
+
+    return detected_pitches
+
+
 def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     # sr=None preserves the file's native sample rate instead of resampling to 22.05kHz.
     waveform, sample_rate = librosa.load(str(audio_path), sr=None)
@@ -168,6 +252,15 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     detected_onsets = [round(float(t), 2) for t in onset_times]
     detected_beats = convert_seconds_to_beats(detected_onsets, tempo_bpm)
     quantized_beats = quantize_beats(detected_beats)
+    detected_bars, measure_beats = calculate_bar_structures(quantized_beats)
+
+    total_duration_beats = duration_seconds * (tempo_bpm / 60.0)
+    note_durations, note_types = calculate_note_durations(quantized_beats, total_duration_beats)
+
+    # Note: using detected_onsets (seconds) here, not detected_beats (which are
+    # scaled by tempo/60 and would misalign frame lookups for any tempo != 60 BPM).
+    detected_pitches = detect_pitches_at_timestamps(waveform, sample_rate, detected_onsets)
+
     detected_notes = detect_notes(waveform, sample_rate, onset_times)
 
     # Sanity-check the audio-to-video frame targeting math against the first
@@ -186,6 +279,11 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
         "detected_onsets": detected_onsets,
         "detected_beats": detected_beats,
         "quantized_beats": quantized_beats,
+        "detected_bars": detected_bars,
+        "measure_beats": measure_beats,
+        "note_durations": note_durations,
+        "note_types": note_types,
+        "detected_pitches": detected_pitches,
         "detected_notes": detected_notes,
     }
 
