@@ -18,6 +18,8 @@ export default function Home() {
   const [durationSeconds, setDurationSeconds] = useState<number | null>(null);
   const [sampleRate, setSampleRate] = useState<number | null>(null);
   const [tempoBpm, setTempoBpm] = useState<number | null>(null);
+  const [detectedChords, setDetectedChords] = useState<string[][]>([]);
+  const [chordStyles, setChordStyles] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -33,6 +35,8 @@ export default function Home() {
     setDurationSeconds(null);
     setSampleRate(null);
     setTempoBpm(null);
+    setDetectedChords([]);
+    setChordStyles([]);
   };
 
   const uploadFile = useCallback(async (file: File) => {
@@ -51,6 +55,8 @@ export default function Home() {
     setDurationSeconds(null);
     setSampleRate(null);
     setTempoBpm(null);
+    setDetectedChords([]);
+    setChordStyles([]);
     setProgress(0);
 
     // Simulated progress while the real upload happens in the background.
@@ -93,6 +99,8 @@ export default function Home() {
         setDurationSeconds(data.duration_seconds);
         setSampleRate(data.sample_rate);
         setTempoBpm(data.tempo_bpm);
+        setDetectedChords(Array.isArray(data.detected_chords) ? data.detected_chords : []);
+        setChordStyles(Array.isArray(data.chord_styles) ? data.chord_styles : []);
       }, 600);
     } catch (err) {
       if (progressIntervalRef.current) {
@@ -194,6 +202,37 @@ export default function Home() {
                   Download MusicXML Data
                 </a>
               </div>
+            </div>
+
+            <div className="rounded-2xl border border-gray-800 bg-gray-900 p-6 shadow-lg shadow-black/40">
+              <h2 className="text-lg font-semibold text-white">Detected Chords</h2>
+              <p className="mt-1 text-sm text-gray-400">
+                Raw per-event chord detection (CQT peak-picking) — not yet aligned to a timeline.
+              </p>
+
+              <ul className="mt-4 max-h-64 space-y-1 overflow-y-auto pr-1 text-sm">
+                {(detectedChords ?? []).length === 0 ? (
+                  <li className="text-gray-500">No chords detected.</li>
+                ) : (
+                  (detectedChords ?? []).map((chord, i) => {
+                    const style = chordStyles?.[i];
+                    return (
+                      <li
+                        key={i}
+                        className="flex items-center justify-between rounded-lg bg-gray-800/60 px-3 py-2"
+                      >
+                        <span className="text-gray-400">
+                          Event {i}
+                          {style ? ` (${style})` : ""}
+                        </span>
+                        <span className="font-medium text-indigo-400">
+                          {chord?.length ? chord.join(", ") : "rest"}
+                        </span>
+                      </li>
+                    );
+                  })
+                )}
+              </ul>
             </div>
 
             <button
