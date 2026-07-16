@@ -32,6 +32,7 @@ pnpm-debug.log*
 # Backend (Python & FastAPI)
 # ==========================================
 # Environments (Your local python packages)
+backend/venv/
 venv/
 .venv/
 env/
