@@ -227,7 +227,7 @@ export default function Home() {
             <div className="rounded-2xl border border-gray-800 bg-gray-900 p-6 shadow-lg shadow-black/40">
               <h2 className="text-lg font-semibold text-white">Detected Events</h2>
               <p className="mt-1 text-sm text-gray-400">
-                Notes grouped into events, filtered by confidence relative to each event's
+                Notes grouped into events, filtered by confidence relative to each events
                 strongest note.
               </p>
 
