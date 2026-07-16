@@ -12,6 +12,18 @@ type RawNote = {
   confidence: number;
 };
 
+type EventNote = RawNote & {
+  fragments_merged: number;
+};
+
+type EventData = {
+  event_time: number;
+  span: number;
+  style: string;
+  notes: EventNote[];
+  dropped_notes: EventNote[];
+};
+
 const ACCEPTED_TYPES = ["video/mp4", "video/quicktime", "video/x-m4v"];
 const API_BASE = "http://localhost:8000";
 
@@ -27,6 +39,7 @@ export default function Home() {
   const [sampleRate, setSampleRate] = useState<number | null>(null);
   const [tempoBpm, setTempoBpm] = useState<number | null>(null);
   const [rawNotes, setRawNotes] = useState<RawNote[]>([]);
+  const [events, setEvents] = useState<EventData[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -43,6 +56,7 @@ export default function Home() {
     setSampleRate(null);
     setTempoBpm(null);
     setRawNotes([]);
+    setEvents([]);
   };
 
   const uploadFile = useCallback(async (file: File) => {
@@ -62,6 +76,7 @@ export default function Home() {
     setSampleRate(null);
     setTempoBpm(null);
     setRawNotes([]);
+    setEvents([]);
     setProgress(0);
 
     // Simulated progress while the real upload happens in the background.
@@ -105,6 +120,7 @@ export default function Home() {
         setSampleRate(data.sample_rate);
         setTempoBpm(data.tempo_bpm);
         setRawNotes(Array.isArray(data.raw_notes) ? data.raw_notes : []);
+        setEvents(Array.isArray(data.events) ? data.events : []);
       }, 600);
     } catch (err) {
       if (progressIntervalRef.current) {
@@ -206,6 +222,34 @@ export default function Home() {
                   Download MusicXML Data
                 </a>
               </div>
+            </div>
+
+            <div className="rounded-2xl border border-gray-800 bg-gray-900 p-6 shadow-lg shadow-black/40">
+              <h2 className="text-lg font-semibold text-white">Detected Events</h2>
+              <p className="mt-1 text-sm text-gray-400">
+                Notes grouped into events, filtered by confidence relative to each event's
+                strongest note.
+              </p>
+
+              <ul className="mt-4 max-h-64 space-y-1 overflow-y-auto pr-1 text-sm">
+                {(events ?? []).length === 0 ? (
+                  <li className="text-gray-500">No events detected.</li>
+                ) : (
+                  (events ?? []).map((event, i) => (
+                    <li
+                      key={i}
+                      className="flex items-center justify-between rounded-lg bg-gray-800/60 px-3 py-2"
+                    >
+                      <span className="text-gray-400">
+                        Event {i} ({event.style})
+                      </span>
+                      <span className="font-medium text-indigo-400">
+                        {event.notes.length ? event.notes.map((n) => n.note).join(", ") : "rest"}
+                      </span>
+                    </li>
+                  ))
+                )}
+              </ul>
             </div>
 
             <div className="rounded-2xl border border-gray-800 bg-gray-900 p-6 shadow-lg shadow-black/40">

@@ -200,6 +200,118 @@ def detect_notes_basic_pitch(audio_path: Path) -> list[dict]:
     return sorted(notes, key=lambda note: note["onset"])
 
 
+DEDUP_GAP_SECONDS = 0.05  # max gap between offset and next onset, same pitch, to treat as one fragmented note
+GROUPING_WINDOW_SECONDS = 0.15  # same value as the old onset grouping
+SOLID_THRESHOLD_SECONDS = 0.03  # same as before, for style classification
+RELATIVE_CONFIDENCE_FRACTION = 0.6  # a note must reach this fraction of its event's strongest note to survive
+ABSOLUTE_CONFIDENCE_FLOOR = 0.35  # hard floor below which nothing survives regardless of group
+
+
+def deduplicate_notes(notes: list[dict], gap_threshold: float = DEDUP_GAP_SECONDS) -> list[dict]:
+    if not notes:
+        return []
+
+    merged = []
+    current = dict(notes[0])
+    current["fragments_merged"] = 1
+
+    for note in notes[1:]:
+        gap = note["onset"] - current["offset"]
+        if note["midi"] == current["midi"] and gap <= gap_threshold:
+            # Chain absorption: current keeps extending as long as the next
+            # fragment matches, so a note split into 3+ pieces still merges
+            # into a single entry rather than just pairwise.
+            current["offset"] = max(current["offset"], note["offset"])
+            current["confidence"] = max(current["confidence"], note["confidence"])
+            current["fragments_merged"] += 1
+        else:
+            merged.append(current)
+            current = dict(note)
+            current["fragments_merged"] = 1
+
+    merged.append(current)
+    return merged
+
+
+def group_notes_into_events(
+    notes: list[dict],
+    grouping_window: float = GROUPING_WINDOW_SECONDS,
+    solid_threshold: float = SOLID_THRESHOLD_SECONDS,
+) -> list[dict]:
+    if not notes:
+        return []
+
+    groups: list[list[dict]] = []
+    current_group: list[dict] = []
+
+    for note in notes:
+        # Chained distance: compare against the previous note already in the
+        # group, not the group's first note, so a run of closely-spaced
+        # attacks can drift further apart than grouping_window in total.
+        if current_group and (note["onset"] - current_group[-1]["onset"]) > grouping_window:
+            groups.append(current_group)
+            current_group = [note]
+        else:
+            current_group.append(note)
+
+    if current_group:
+        groups.append(current_group)
+
+    events = []
+    for group in groups:
+        onsets = [note["onset"] for note in group]
+        span = round(max(onsets) - min(onsets), 3)
+
+        if len(group) == 1:
+            style = "single"
+        elif span <= solid_threshold:
+            style = "solid"
+        else:
+            style = "rolled"
+
+        events.append(
+            {
+                "event_time": min(onsets),
+                "span": span,
+                "style": style,
+                "notes": group,
+            }
+        )
+
+    return events
+
+
+def filter_event_notes(
+    events: list[dict],
+    relative_fraction: float = RELATIVE_CONFIDENCE_FRACTION,
+    absolute_floor: float = ABSOLUTE_CONFIDENCE_FLOOR,
+) -> list[dict]:
+    filtered_events = []
+
+    for event in events:
+        max_confidence = max(note["confidence"] for note in event["notes"])
+
+        surviving = []
+        dropped = []
+        for note in event["notes"]:
+            if note["confidence"] >= absolute_floor and note["confidence"] >= relative_fraction * max_confidence:
+                surviving.append(note)
+            else:
+                dropped.append(note)
+
+        filtered_events.append(
+            {
+                "event_time": event["event_time"],
+                "span": event["span"],
+                "style": event["style"],
+                "notes": surviving,
+                "dropped_notes": dropped,
+            }
+        )
+
+    return filtered_events
+
+
 def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     # sr=None preserves the file's native sample rate instead of resampling to 22.05kHz.
     waveform, sample_rate = librosa.load(str(audio_path), sr=None)
@@ -210,6 +322,9 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     tempo_bpm = float(np.asarray(tempo).reshape(-1)[0])
 
     notes = detect_notes_basic_pitch(audio_path)
+    deduped = deduplicate_notes(notes)
+    events = group_notes_into_events(deduped)
+    filtered_events = filter_event_notes(events)
 
     # Sanity-check the audio-to-video frame targeting math against the first
     # few note onsets before it's relied on for real multimodal analysis.
@@ -226,6 +341,7 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
         "sample_rate": int(sample_rate),
         "tempo_bpm": round(tempo_bpm, 1),
         "raw_notes": notes,
+        "events": filtered_events,
     }
 
 
