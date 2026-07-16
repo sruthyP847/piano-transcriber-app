@@ -201,36 +201,56 @@ def detect_notes_basic_pitch(audio_path: Path) -> list[dict]:
 
 
 DEDUP_GAP_SECONDS = 0.05  # max gap between offset and next onset, same pitch, to treat as one fragmented note
+DEDUP_MAX_SPAN_SECONDS = 2.0  # cap on total merged-note duration; the longest genuine single-attack note observed in testing is ~1.65s, so a chain exceeding this is almost certainly separate re-attacks, not one fragmented note
 GROUPING_WINDOW_SECONDS = 0.15  # same value as the old onset grouping
 SOLID_THRESHOLD_SECONDS = 0.03  # same as before, for style classification
 RELATIVE_CONFIDENCE_FRACTION = 0.6  # a note must reach this fraction of its event's strongest note to survive
 ABSOLUTE_CONFIDENCE_FLOOR = 0.35  # hard floor below which nothing survives regardless of group
 
 
-def deduplicate_notes(notes: list[dict], gap_threshold: float = DEDUP_GAP_SECONDS) -> list[dict]:
+def deduplicate_notes(
+    notes: list[dict],
+    gap_threshold: float = DEDUP_GAP_SECONDS,
+    max_span: float = DEDUP_MAX_SPAN_SECONDS,
+) -> list[dict]:
     if not notes:
         return []
 
+    # Group by pitch first so same-pitch fragments merge correctly even when
+    # an unrelated note's onset sorts between them chronologically — merging
+    # only adjacent entries in one global onset-sorted list would miss those.
+    by_pitch: dict[int, list[dict]] = {}
+    for note in notes:
+        by_pitch.setdefault(note["midi"], []).append(note)
+
     merged = []
-    current = dict(notes[0])
-    current["fragments_merged"] = 1
+    for pitch_notes in by_pitch.values():
+        pitch_notes.sort(key=lambda note: note["onset"])
 
-    for note in notes[1:]:
-        gap = note["onset"] - current["offset"]
-        if note["midi"] == current["midi"] and gap <= gap_threshold:
-            # Chain absorption: current keeps extending as long as the next
-            # fragment matches, so a note split into 3+ pieces still merges
-            # into a single entry rather than just pairwise.
-            current["offset"] = max(current["offset"], note["offset"])
-            current["confidence"] = max(current["confidence"], note["confidence"])
-            current["fragments_merged"] += 1
-        else:
-            merged.append(current)
-            current = dict(note)
-            current["fragments_merged"] = 1
+        current = dict(pitch_notes[0])
+        current["fragments_merged"] = 1
 
-    merged.append(current)
-    return merged
+        for note in pitch_notes[1:]:
+            gap = note["onset"] - current["offset"]
+            prospective_span = note["offset"] - current["onset"]
+            if gap <= gap_threshold and prospective_span <= max_span:
+                # Chain absorption: current keeps extending as long as the next
+                # fragment matches, so a note split into 3+ pieces still merges
+                # into a single entry rather than just pairwise. The span cap
+                # stops this from chaining across genuinely separate re-attacks
+                # of the same pitch (e.g. the same note in two different chords)
+                # that happen to have near-zero gaps between them.
+                current["offset"] = max(current["offset"], note["offset"])
+                current["confidence"] = max(current["confidence"], note["confidence"])
+                current["fragments_merged"] += 1
+            else:
+                merged.append(current)
+                current = dict(note)
+                current["fragments_merged"] = 1
+
+        merged.append(current)
+
+    return sorted(merged, key=lambda note: note["onset"])
 
 
 def group_notes_into_events(
@@ -312,6 +332,58 @@ def filter_event_notes(
     return filtered_events
 
 
+DECAY_TAIL_DURATION_THRESHOLD = 0.4
+DECAY_TAIL_PITCH_LOOKBACK_EVENTS = 2
+DECAY_TAIL_DECAY_MARGIN_SECONDS = 0.5
+
+
+def suppress_decay_tail_notes(events: list[dict]) -> list[dict]:
+    result = []
+
+    for i, event in enumerate(events):
+        # Lookback uses the original filtered events, not the progressively
+        # rebuilt result, so each event is judged against what actually
+        # survived filter_event_notes — not against this function's own
+        # earlier decisions.
+        lookback_events = events[max(0, i - DECAY_TAIL_PITCH_LOOKBACK_EVENTS) : i]
+
+        surviving = []
+        dropped = list(event["dropped_notes"])
+
+        for note in event["notes"]:
+            duration = note["offset"] - note["onset"]
+            is_short = duration < DECAY_TAIL_DURATION_THRESHOLD
+
+            matches_recent_pitch = False
+            if is_short:
+                for prev_event in lookback_events:
+                    for prev_note in prev_event["notes"]:
+                        same_pitch_class = (prev_note["midi"] % 12) == (note["midi"] % 12)
+                        within_margin = note["onset"] <= prev_note["offset"] + DECAY_TAIL_DECAY_MARGIN_SECONDS
+                        if same_pitch_class and within_margin:
+                            matches_recent_pitch = True
+                            break
+                    if matches_recent_pitch:
+                        break
+
+            if is_short and matches_recent_pitch:
+                dropped.append(note)
+            else:
+                surviving.append(note)
+
+        result.append(
+            {
+                "event_time": event["event_time"],
+                "span": event["span"],
+                "style": event["style"],
+                "notes": surviving,
+                "dropped_notes": dropped,
+            }
+        )
+
+    return result
+
+
 def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     # sr=None preserves the file's native sample rate instead of resampling to 22.05kHz.
     waveform, sample_rate = librosa.load(str(audio_path), sr=None)
@@ -325,6 +397,7 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     deduped = deduplicate_notes(notes)
     events = group_notes_into_events(deduped)
     filtered_events = filter_event_notes(events)
+    filtered_events = suppress_decay_tail_notes(filtered_events)
 
     # Sanity-check the audio-to-video frame targeting math against the first
     # few note onsets before it's relied on for real multimodal analysis.
