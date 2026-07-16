@@ -99,6 +99,8 @@ def generate_placeholder_musicxml(musicxml_path: Path) -> None:
 NOTE_SLICE_SECONDS = 0.3
 GROUPING_WINDOW_SECONDS = 0.15
 SOLID_THRESHOLD_SECONDS = 0.03
+WINDOW_SAFETY_MARGIN_SECONDS = 0.02  # stop this far before next onset
+MIN_WINDOW_SECONDS = 0.10  # floor so windows are never too short for a stable pitch read
 
 
 def group_onsets_into_events(
@@ -239,6 +241,7 @@ def detect_chords_cqt(
     waveform: np.ndarray,
     sample_rate: int,
     events: list[dict],
+    duration_seconds: float,
     n_bins: int = 84,
     bins_per_octave: int = 12,
     relative_threshold: float = 0.25,
@@ -260,13 +263,27 @@ def detect_chords_cqt(
     )
 
     detected_chords = []
-    for event in events:
-        event_time = event["event_time"]
-        # Window covers every attack in the event (span) plus enough decay
-        # time after the last attack to read a stable pitch for it.
-        window_length = event["span"] + NOTE_SLICE_SECONDS
+    for i, event in enumerate(events):
+        window_start = event["event_time"]
+
+        # Onset-to-onset windowing: read pitch only up to just before the next
+        # event's attack, so its transient never contaminates this chord.
+        if i + 1 < len(events):
+            window_end = events[i + 1]["event_time"] - WINDOW_SAFETY_MARGIN_SECONDS
+        else:
+            window_end = duration_seconds
+
+        # Floor: never so short that the pitch read is unstable.
+        if window_end - window_start < MIN_WINDOW_SECONDS:
+            window_end = window_start + MIN_WINDOW_SECONDS
+        # Ceiling: for long gaps, don't average in seconds of decay/silence.
+        max_window_end = window_start + event["span"] + NOTE_SLICE_SECONDS + 0.2
+        window_end = min(window_end, max_window_end)
+        # Never read past the end of the audio.
+        window_end = min(window_end, duration_seconds)
+
         window_indices = np.where(
-            (frame_times >= event_time) & (frame_times < event_time + window_length)
+            (frame_times >= window_start) & (frame_times < window_end)
         )[0]
 
         if window_indices.size == 0:
@@ -321,7 +338,7 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     total_duration_beats = duration_seconds * (tempo_bpm / 60.0)
     note_durations, note_types = calculate_note_durations(quantized_beats, total_duration_beats)
 
-    detected_chords = detect_chords_cqt(waveform, sample_rate, events)
+    detected_chords = detect_chords_cqt(waveform, sample_rate, events, duration_seconds)
 
     # Sanity-check the audio-to-video frame targeting math against the first
     # few onsets before it's relied on for real multimodal analysis.
