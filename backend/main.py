@@ -4,6 +4,8 @@ from pathlib import Path
 import cv2
 import librosa
 import numpy as np
+from basic_pitch import ICASSP_2022_MODEL_PATH
+from basic_pitch.inference import predict
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -96,59 +98,6 @@ def generate_placeholder_musicxml(musicxml_path: Path) -> None:
     musicxml_path.write_text(xml, encoding="utf-8")
 
 
-NOTE_SLICE_SECONDS = 0.3
-GROUPING_WINDOW_SECONDS = 0.15
-SOLID_THRESHOLD_SECONDS = 0.03
-WINDOW_SAFETY_MARGIN_SECONDS = 0.02  # stop this far before next onset
-MIN_WINDOW_SECONDS = 0.10  # floor so windows are never too short for a stable pitch read
-
-
-def group_onsets_into_events(
-    onset_times: np.ndarray,
-    grouping_window: float = GROUPING_WINDOW_SECONDS,
-    solid_threshold: float = SOLID_THRESHOLD_SECONDS,
-) -> list[dict]:
-    sorted_onsets = sorted(float(t) for t in onset_times)
-
-    groups: list[list[float]] = []
-    current_group: list[float] = []
-
-    for onset in sorted_onsets:
-        # Chained distance: compare against the previous onset already in the
-        # group, not the group's first onset, so a run of closely-spaced
-        # attacks can drift further apart than grouping_window in total.
-        if current_group and (onset - current_group[-1]) > grouping_window:
-            groups.append(current_group)
-            current_group = [onset]
-        else:
-            current_group.append(onset)
-
-    if current_group:
-        groups.append(current_group)
-
-    events = []
-    for group in groups:
-        span = round(max(group) - min(group), 3)
-
-        if len(group) == 1:
-            style = "single"
-        elif span <= solid_threshold:
-            style = "solid"
-        else:
-            style = "rolled"
-
-        events.append(
-            {
-                "event_time": min(group),
-                "onset_times": group,
-                "span": span,
-                "style": style,
-            }
-        )
-
-    return events
-
-
 def extract_frame_at_time(video_path: Path, timestamp_seconds: float) -> np.ndarray | None:
     cap = cv2.VideoCapture(str(video_path))
     try:
@@ -234,84 +183,21 @@ def calculate_note_durations(
     return note_durations, note_types
 
 
-CQT_HOP_LENGTH = 512
+def detect_notes_basic_pitch(audio_path: Path) -> list[dict]:
+    _, _, note_events = predict(str(audio_path), ICASSP_2022_MODEL_PATH)
 
+    notes = [
+        {
+            "onset": float(onset),
+            "offset": float(offset),
+            "note": librosa.midi_to_note(midi_pitch),
+            "midi": int(midi_pitch),
+            "confidence": float(amplitude),
+        }
+        for onset, offset, midi_pitch, amplitude, _pitch_bends in note_events
+    ]
 
-def detect_chords_cqt(
-    waveform: np.ndarray,
-    sample_rate: int,
-    events: list[dict],
-    duration_seconds: float,
-    n_bins: int = 84,
-    bins_per_octave: int = 12,
-    relative_threshold: float = 0.25,
-) -> list[list[str]]:
-    fmin = librosa.midi_to_hz(36)  # C1
-
-    cqt_magnitude = np.abs(
-        librosa.cqt(
-            y=waveform,
-            sr=sample_rate,
-            fmin=fmin,
-            n_bins=n_bins,
-            bins_per_octave=bins_per_octave,
-            hop_length=CQT_HOP_LENGTH,
-        )
-    )
-    frame_times = librosa.frames_to_time(
-        np.arange(cqt_magnitude.shape[1]), sr=sample_rate, hop_length=CQT_HOP_LENGTH
-    )
-
-    detected_chords = []
-    for i, event in enumerate(events):
-        window_start = event["event_time"]
-
-        # Onset-to-onset windowing: read pitch only up to just before the next
-        # event's attack, so its transient never contaminates this chord.
-        if i + 1 < len(events):
-            window_end = events[i + 1]["event_time"] - WINDOW_SAFETY_MARGIN_SECONDS
-        else:
-            window_end = duration_seconds
-
-        # Floor: never so short that the pitch read is unstable.
-        if window_end - window_start < MIN_WINDOW_SECONDS:
-            window_end = window_start + MIN_WINDOW_SECONDS
-        # Ceiling: for long gaps, don't average in seconds of decay/silence.
-        max_window_end = window_start + event["span"] + NOTE_SLICE_SECONDS + 0.2
-        window_end = min(window_end, max_window_end)
-        # Never read past the end of the audio.
-        window_end = min(window_end, duration_seconds)
-
-        window_indices = np.where(
-            (frame_times >= window_start) & (frame_times < window_end)
-        )[0]
-
-        if window_indices.size == 0:
-            detected_chords.append([])
-            continue
-
-        magnitude = cqt_magnitude[:, window_indices].mean(axis=1)
-        peak_magnitude = magnitude.max()
-
-        if peak_magnitude <= 0:
-            detected_chords.append([])
-            continue
-
-        # Iterating bins low-to-high means active_bins comes out pitch-sorted
-        # for free (bin index i == MIDI 36 + i, monotonically increasing).
-        active_bins = []
-        for i in range(n_bins):
-            if magnitude[i] <= relative_threshold * peak_magnitude:
-                continue
-            left = magnitude[i - 1] if i > 0 else -np.inf
-            right = magnitude[i + 1] if i < n_bins - 1 else -np.inf
-            if magnitude[i] >= left and magnitude[i] >= right:
-                active_bins.append(i)
-
-        chord_notes = [librosa.midi_to_note(36 + i) for i in active_bins]
-        detected_chords.append(chord_notes)
-
-    return detected_chords
+    return sorted(notes, key=lambda note: note["onset"])
 
 
 def analyze_audio(audio_path: Path, video_path: Path) -> dict:
@@ -323,26 +209,12 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     # librosa returns tempo as a 1-element array rather than a bare scalar.
     tempo_bpm = float(np.asarray(tempo).reshape(-1)[0])
 
-    onset_frames = librosa.onset.onset_detect(y=waveform, sr=sample_rate, units="frames")
-    onset_times = librosa.frames_to_time(onset_frames, sr=sample_rate)
-
-    events = group_onsets_into_events(onset_times)
-    event_times = [event["event_time"] for event in events]
-    chord_styles = [event["style"] for event in events]
-
-    detected_onsets = [round(float(t), 2) for t in event_times]
-    detected_beats = convert_seconds_to_beats(detected_onsets, tempo_bpm)
-    quantized_beats = quantize_beats(detected_beats)
-    detected_bars, measure_beats = calculate_bar_structures(quantized_beats)
-
-    total_duration_beats = duration_seconds * (tempo_bpm / 60.0)
-    note_durations, note_types = calculate_note_durations(quantized_beats, total_duration_beats)
-
-    detected_chords = detect_chords_cqt(waveform, sample_rate, events, duration_seconds)
+    notes = detect_notes_basic_pitch(audio_path)
 
     # Sanity-check the audio-to-video frame targeting math against the first
-    # few onsets before it's relied on for real multimodal analysis.
-    for onset_time in detected_onsets[:3]:
+    # few note onsets before it's relied on for real multimodal analysis.
+    for note in notes[:3]:
+        onset_time = note["onset"]
         frame = extract_frame_at_time(video_path, onset_time)
         if frame is not None:
             print(f"[frame check] onset={onset_time}s -> frame shape {frame.shape}")
@@ -353,15 +225,7 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
         "duration_seconds": round(float(duration_seconds), 3),
         "sample_rate": int(sample_rate),
         "tempo_bpm": round(tempo_bpm, 1),
-        "detected_onsets": detected_onsets,
-        "detected_beats": detected_beats,
-        "quantized_beats": quantized_beats,
-        "detected_bars": detected_bars,
-        "measure_beats": measure_beats,
-        "note_durations": note_durations,
-        "note_types": note_types,
-        "detected_chords": detected_chords,
-        "chord_styles": chord_styles,
+        "raw_notes": notes,
     }
 
 
