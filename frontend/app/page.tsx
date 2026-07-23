@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 type Status = "idle" | "uploading" | "processing" | "success" | "error";
 
@@ -31,6 +31,13 @@ type TimeSignatureMode = "auto" | "specify";
 const SIMPLE_METERS = ["4/4", "3/4", "2/4"];
 const COMPOUND_METERS = ["6/8", "9/8", "12/8"];
 
+// Standard 88-key range, A0..C8.
+const NOTE_LETTERS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+function midiToNoteName(midi: number): string {
+  return `${NOTE_LETTERS[midi % 12]}${Math.floor(midi / 12) - 1}`;
+}
+const PIANO_NOTE_RANGE = Array.from({ length: 108 - 21 + 1 }, (_, i) => midiToNoteName(21 + i));
+
 export default function Home() {
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState(0);
@@ -51,8 +58,57 @@ export default function Home() {
   const [tempoBpmInput, setTempoBpmInput] = useState("");
   const [hasPickup, setHasPickup] = useState(false);
   const [pickupBeatsInput, setPickupBeatsInput] = useState("");
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [previewFrameUrl, setPreviewFrameUrl] = useState<string | null>(null);
+  const [previewFrameWidth, setPreviewFrameWidth] = useState(0);
+  const [frameExtractionError, setFrameExtractionError] = useState<string | null>(null);
+  const [leftBoundaryFraction, setLeftBoundaryFraction] = useState(0.1);
+  const [rightBoundaryFraction, setRightBoundaryFraction] = useState(0.9);
+  const [leftmostNote, setLeftmostNote] = useState("");
+  const [rightmostNote, setRightmostNote] = useState("");
+  const [draggingHandle, setDraggingHandle] = useState<"left" | "right" | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const cropContainerRef = useRef<HTMLDivElement>(null);
+  const leftFractionRef = useRef(leftBoundaryFraction);
+  const rightFractionRef = useRef(rightBoundaryFraction);
+
+  useEffect(() => {
+    leftFractionRef.current = leftBoundaryFraction;
+  }, [leftBoundaryFraction]);
+  useEffect(() => {
+    rightFractionRef.current = rightBoundaryFraction;
+  }, [rightBoundaryFraction]);
+
+  // Drag handling for the crop handles -- subscribes once per drag session
+  // (reading the other handle's latest position via ref, not state, so the
+  // listeners don't need to be torn down and re-added on every pixel of
+  // movement).
+  useEffect(() => {
+    if (!draggingHandle) return;
+
+    const handleMove = (e: MouseEvent) => {
+      const container = cropContainerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const fraction = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      if (draggingHandle === "left") {
+        setLeftBoundaryFraction(Math.min(fraction, rightFractionRef.current - 0.02));
+      } else {
+        setRightBoundaryFraction(Math.max(fraction, leftFractionRef.current + 0.02));
+      }
+    };
+    const handleUp = () => setDraggingHandle(null);
+
+    // Mouse events (not Pointer Events) for broadest compatibility with both
+    // real users and automated input synthesis.
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [draggingHandle]);
 
   const resetState = () => {
     setStatus("idle");
@@ -67,6 +123,88 @@ export default function Home() {
     setTempoBpm(null);
     setRawNotes([]);
     setEvents([]);
+    setSelectedFile(null);
+    setPreviewFrameUrl(null);
+    setPreviewFrameWidth(0);
+    setFrameExtractionError(null);
+    setLeftBoundaryFraction(0.1);
+    setRightBoundaryFraction(0.9);
+    setLeftmostNote("");
+    setRightmostNote("");
+  };
+
+  // Extracts a single preview frame from a locally-selected video file,
+  // entirely client-side (off-DOM <video> + <canvas>) -- no backend
+  // round-trip needed just to show the user their keyboard for calibration.
+  const extractPreviewFrame = useCallback((file: File) => {
+    setFrameExtractionError(null);
+    setPreviewFrameUrl(null);
+
+    const videoUrl = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.src = videoUrl;
+
+    const cleanup = () => URL.revokeObjectURL(videoUrl);
+
+    video.addEventListener("loadedmetadata", () => {
+      video.currentTime = Math.min(0.1, video.duration / 2);
+    });
+
+    video.addEventListener("seeked", () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        setFrameExtractionError("Could not extract a preview frame from this video.");
+        cleanup();
+        return;
+      }
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      setPreviewFrameUrl(canvas.toDataURL("image/png"));
+      setPreviewFrameWidth(canvas.width);
+      cleanup();
+    });
+
+    video.addEventListener("error", () => {
+      setFrameExtractionError("Could not read this video file to extract a preview frame.");
+      cleanup();
+    });
+  }, []);
+
+  const handleFileChosen = useCallback(
+    (file: File) => {
+      if (!ACCEPTED_TYPES.includes(file.type)) {
+        setStatus("error");
+        setErrorMessage("Unsupported file type. Please upload an MP4 or MOV video.");
+        return;
+      }
+      setStatus("idle");
+      setErrorMessage(null);
+      setSelectedFile(file);
+      setFileName(file.name);
+      setLeftBoundaryFraction(0.1);
+      setRightBoundaryFraction(0.9);
+      setLeftmostNote("");
+      setRightmostNote("");
+      extractPreviewFrame(file);
+    },
+    [extractPreviewFrame]
+  );
+
+  const clearSelectedFile = () => {
+    setSelectedFile(null);
+    setFileName(null);
+    setPreviewFrameUrl(null);
+    setPreviewFrameWidth(0);
+    setFrameExtractionError(null);
+    setLeftmostNote("");
+    setRightmostNote("");
+    setLeftBoundaryFraction(0.1);
+    setRightBoundaryFraction(0.9);
   };
 
   const uploadFile = useCallback(async (file: File) => {
@@ -164,24 +302,33 @@ export default function Home() {
       setIsDragging(false);
       const file = e.dataTransfer.files?.[0];
       if (file) {
-        uploadFile(file);
+        handleFileChosen(file);
       }
     },
-    [uploadFile]
+    [handleFileChosen]
   );
 
   const handleFileSelect = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (file) {
-        uploadFile(file);
+        handleFileChosen(file);
       }
       e.target.value = "";
     },
-    [uploadFile]
+    [handleFileChosen]
   );
 
   const isBusy = status === "uploading" || status === "processing";
+  const keyboardPixelLeft = previewFrameWidth ? leftBoundaryFraction * previewFrameWidth : null;
+  const keyboardPixelRight = previewFrameWidth ? rightBoundaryFraction * previewFrameWidth : null;
+  const calibrationComplete = Boolean(
+    selectedFile &&
+      previewFrameUrl &&
+      leftmostNote &&
+      rightmostNote &&
+      PIANO_NOTE_RANGE.indexOf(leftmostNote) < PIANO_NOTE_RANGE.indexOf(rightmostNote)
+  );
 
   if (status === "success" && savedFilename && pdfUrl && musicxmlUrl) {
     const videoUrl = `${API_BASE}/api/uploads/${savedFilename}`;
@@ -493,53 +640,8 @@ export default function Home() {
           </div>
         )}
 
-        <div
-          onDragOver={(e) => {
-            e.preventDefault();
-            setIsDragging(true);
-          }}
-          onDragLeave={() => setIsDragging(false)}
-          onDrop={handleDrop}
-          onClick={() => !isBusy && fileInputRef.current?.click()}
-          className={`flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-12 text-center transition-colors ${
-            isBusy
-              ? "cursor-not-allowed border-gray-200 bg-gray-100"
-              : "cursor-pointer border-gray-300 bg-white hover:border-indigo-400 hover:bg-indigo-50"
-          } ${isDragging ? "border-indigo-500 bg-indigo-50" : ""}`}
-        >
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="video/mp4,video/quicktime,video/x-m4v"
-            className="hidden"
-            onChange={handleFileSelect}
-            disabled={isBusy}
-          />
-
-          <svg
-            className="mb-4 h-12 w-12 text-gray-400"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={1.5}
-              d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
-            />
-          </svg>
-
-          {status === "idle" && (
-            <>
-              <p className="text-sm font-medium text-gray-700">
-                Drag and drop your video here, or click to browse
-              </p>
-              <p className="mt-1 text-xs text-gray-400">MP4 or MOV, up to your backend&apos;s limit</p>
-            </>
-          )}
-
-          {isBusy && (
+        {isBusy && (
+          <div className="flex flex-col items-center justify-center rounded-2xl border-2 border-dashed border-gray-200 bg-gray-100 p-12 text-center">
             <div className="w-full max-w-xs">
               <p className="mb-2 truncate text-sm font-medium text-gray-700">{fileName}</p>
               <div className="h-2 w-full overflow-hidden rounded-full bg-gray-200">
@@ -552,15 +654,174 @@ export default function Home() {
                 {status === "uploading" ? `Uploading... ${Math.round(progress)}%` : "Processing..."}
               </p>
             </div>
-          )}
+          </div>
+        )}
 
-          {status === "error" && (
-            <>
-              <p className="text-sm font-medium text-red-600">{errorMessage}</p>
-              <p className="mt-1 text-xs text-gray-400">Click to try again</p>
-            </>
-          )}
-        </div>
+        {!isBusy && (!selectedFile || status === "error") && (
+          <div
+            onDragOver={(e) => {
+              e.preventDefault();
+              setIsDragging(true);
+            }}
+            onDragLeave={() => setIsDragging(false)}
+            onDrop={handleDrop}
+            onClick={() => fileInputRef.current?.click()}
+            className={`flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-12 text-center transition-colors cursor-pointer border-gray-300 bg-white hover:border-indigo-400 hover:bg-indigo-50 ${
+              isDragging ? "border-indigo-500 bg-indigo-50" : ""
+            }`}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="video/mp4,video/quicktime,video/x-m4v"
+              className="hidden"
+              onChange={handleFileSelect}
+            />
+
+            <svg
+              className="mb-4 h-12 w-12 text-gray-400"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={1.5}
+                d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
+              />
+            </svg>
+
+            {status === "idle" && (
+              <>
+                <p className="text-sm font-medium text-gray-700">
+                  Drag and drop your video here, or click to browse
+                </p>
+                <p className="mt-1 text-xs text-gray-400">MP4 or MOV, up to your backend&apos;s limit</p>
+              </>
+            )}
+
+            {status === "error" && (
+              <>
+                <p className="text-sm font-medium text-red-600">{errorMessage}</p>
+                <p className="mt-1 text-xs text-gray-400">Click to try again</p>
+              </>
+            )}
+          </div>
+        )}
+
+        {!isBusy && selectedFile && status !== "error" && (
+          <div className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-gray-900">Mark the keyboard</h2>
+              <button
+                onClick={clearSelectedFile}
+                className="text-xs text-gray-500 underline hover:text-gray-700"
+              >
+                Choose a different video
+              </button>
+            </div>
+            <p className="mt-1 text-xs text-gray-500">
+              Drag the two handles to the keyboard&apos;s left and right edges, then tell us which
+              notes are visible there.
+            </p>
+
+            {frameExtractionError && (
+              <p className="mt-3 text-sm text-red-600">{frameExtractionError}</p>
+            )}
+
+            {previewFrameUrl && (
+              <div
+                ref={cropContainerRef}
+                className="relative mt-4 w-full touch-none select-none overflow-hidden rounded-xl"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={previewFrameUrl}
+                  alt="Video preview frame"
+                  className="block h-auto w-full"
+                  draggable={false}
+                />
+                <div
+                  className="absolute inset-y-0 left-0 bg-black/40"
+                  style={{ width: `${leftBoundaryFraction * 100}%` }}
+                />
+                <div
+                  className="absolute inset-y-0 right-0 bg-black/40"
+                  style={{ width: `${(1 - rightBoundaryFraction) * 100}%` }}
+                />
+                <div
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    setDraggingHandle("left");
+                  }}
+                  className="absolute inset-y-0 -ml-1.5 w-3 cursor-ew-resize bg-indigo-500"
+                  style={{ left: `${leftBoundaryFraction * 100}%` }}
+                />
+                <div
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    setDraggingHandle("right");
+                  }}
+                  className="absolute inset-y-0 -ml-1.5 w-3 cursor-ew-resize bg-indigo-500"
+                  style={{ left: `${rightBoundaryFraction * 100}%` }}
+                />
+              </div>
+            )}
+
+            {!previewFrameUrl && !frameExtractionError && (
+              <p className="mt-4 text-sm text-gray-500">Extracting a preview frame…</p>
+            )}
+
+            <p className="mt-2 text-xs text-gray-500">
+              Left edge:{" "}
+              {keyboardPixelLeft !== null ? `${keyboardPixelLeft.toFixed(1)}px` : "—"} · Right
+              edge: {keyboardPixelRight !== null ? `${keyboardPixelRight.toFixed(1)}px` : "—"}
+              {previewFrameWidth ? ` (of ${previewFrameWidth}px wide frame)` : ""}
+            </p>
+
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-gray-500">Leftmost visible note</label>
+                <select
+                  value={leftmostNote}
+                  onChange={(e) => setLeftmostNote(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900"
+                >
+                  <option value="">Select a note…</option>
+                  {PIANO_NOTE_RANGE.map((note) => (
+                    <option key={note} value={note}>
+                      {note}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500">Rightmost visible note</label>
+                <select
+                  value={rightmostNote}
+                  onChange={(e) => setRightmostNote(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900"
+                >
+                  <option value="">Select a note…</option>
+                  {PIANO_NOTE_RANGE.map((note) => (
+                    <option key={note} value={note}>
+                      {note}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <button
+              onClick={() => selectedFile && uploadFile(selectedFile)}
+              disabled={!calibrationComplete}
+              className="mt-4 w-full rounded-xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-gray-300"
+            >
+              Transcribe
+            </button>
+          </div>
+        )}
 
         {status === "error" && (
           <button

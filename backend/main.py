@@ -377,6 +377,103 @@ def extract_frame_at_time(video_path: Path, timestamp_seconds: float) -> np.ndar
         cap.release()
 
 
+# --- Keyboard calibration (video/CV layer, Stage 1) ---
+#
+# Real key geometry, sourced from Wikimedia Commons "Pianoteilung.svg"
+# (https://commons.wikimedia.org/wiki/File:Pianoteilung.svg), the diagram
+# used on German Wikipedia's "Klaviatur" article to illustrate real piano
+# key spacing ("Pianoteilung" = piano key division). It's a to-scale
+# technical drawing with real coordinate paths, not a stylized approximation.
+# Cross-checked against real-world figures independently: the drawing's
+# white key width works out to 23.6mm, matching DIN 8995 (118.0cm across
+# 50 white keys / 7 octaves = 23.6mm/white key), and 7 * 23.6mm = 165.2mm,
+# matching the well-established ~165.1mm (6.5") standard octave span.
+# The ratios below were computed directly from the SVG's raw path
+# coordinates (in white-key-width units): all 5 black keys independently
+# work out to the identical 0.53814 width fraction, which cross-validates
+# the source data as internally consistent, not a transcription error.
+WHITE_KEY_PITCH_CLASSES = {0: "C", 2: "D", 4: "E", 5: "F", 7: "G", 9: "A", 11: "B"}
+BLACK_KEY_WIDTH_FRACTION = 0.53814  # fraction of white-key-width
+# Left-edge offset of each black key, in white-key-width units, measured
+# from the left edge of its octave's C -- asymmetric by design, not evenly
+# spaced (e.g. C# sits well into the C-D gap, not centered on it).
+BLACK_KEY_LEFT_OFFSETS = {
+    1: ("C#", 0.65683),
+    3: ("D#", 1.84313),
+    6: ("F#", 3.61002),
+    8: ("G#", 4.74998),
+    10: ("A#", 5.88994),
+}
+
+
+def _key_geometry(midi: int) -> tuple[str, float, float]:
+    """Returns (note_name, left_offset_in_white_widths, width_in_white_widths)
+    for a MIDI note, positioned on an absolute scale where octave N (MIDI
+    12*N..12*N+11) occupies white-key-width units [7N, 7N+7)."""
+    octave_index = midi // 12
+    pitch_class = midi % 12
+    octave_start = octave_index * 7
+    octave_number = octave_index - 1  # MIDI 60 (pitch class 0) -> C4
+
+    if pitch_class in WHITE_KEY_PITCH_CLASSES:
+        letter = WHITE_KEY_PITCH_CLASSES[pitch_class]
+        white_index = list(WHITE_KEY_PITCH_CLASSES).index(pitch_class)
+        return f"{letter}{octave_number}", octave_start + white_index, 1.0
+
+    letter, left_offset = BLACK_KEY_LEFT_OFFSETS[pitch_class]
+    return f"{letter}{octave_number}", octave_start + left_offset, BLACK_KEY_WIDTH_FRACTION
+
+
+def build_keyboard_calibration(
+    leftmost_note: str,
+    rightmost_note: str,
+    keyboard_pixel_left: float,
+    keyboard_pixel_right: float,
+) -> dict:
+    leftmost_midi = note_name_to_midi(leftmost_note)
+    rightmost_midi = note_name_to_midi(rightmost_note)
+    if rightmost_midi <= leftmost_midi:
+        raise ValueError("rightmost_note must be higher than leftmost_note")
+
+    _, left_anchor_offset, _ = _key_geometry(leftmost_midi)
+    _, right_anchor_offset, right_anchor_width = _key_geometry(rightmost_midi)
+    span_in_white_widths = (right_anchor_offset + right_anchor_width) - left_anchor_offset
+    pixels_per_white_width = (keyboard_pixel_right - keyboard_pixel_left) / span_in_white_widths
+
+    def offset_to_pixel(offset_in_white_widths: float) -> float:
+        return keyboard_pixel_left + (offset_in_white_widths - left_anchor_offset) * pixels_per_white_width
+
+    keys = {}
+    for midi in range(leftmost_midi, rightmost_midi + 1):
+        note_name, left_offset, width = _key_geometry(midi)
+        left_px = offset_to_pixel(left_offset)
+        right_px = offset_to_pixel(left_offset + width)
+        is_white = (midi % 12) in WHITE_KEY_PITCH_CLASSES
+        keys[note_name] = {
+            "midi": midi,
+            "is_white": is_white,
+            "left_px": left_px,
+            "right_px": right_px,
+            "center_px": (left_px + right_px) / 2,
+        }
+
+    def pixel_to_note(x: float) -> str:
+        # Black keys are drawn "on top" of white keys, so check them first --
+        # an x that falls within a black key's range is the black key, even
+        # though a white key's range also technically covers that x.
+        for is_white_pass in (False, True):
+            for note_name, bounds in keys.items():
+                if bounds["is_white"] != is_white_pass:
+                    continue
+                if bounds["left_px"] <= x < bounds["right_px"]:
+                    return note_name
+        # Outside the calibrated range -- clamp to the nearest edge key.
+        nearest = min(keys.items(), key=lambda item: abs(item[1]["center_px"] - x))
+        return nearest[0]
+
+    return {"keys": keys, "pixel_to_note": pixel_to_note}
+
+
 def convert_seconds_to_beats(onset_times: list[float], tempo_bpm: float) -> list[float]:
     return [round(timestamp * (tempo_bpm / 60.0), 2) for timestamp in onset_times]
 
