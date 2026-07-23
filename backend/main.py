@@ -1,6 +1,8 @@
+import math
 import uuid
 from pathlib import Path
 
+import abjad
 import cv2
 import librosa
 import numpy as np
@@ -96,6 +98,238 @@ def generate_placeholder_musicxml(musicxml_path: Path) -> None:
 </score-partwise>
 """
     musicxml_path.write_text(xml, encoding="utf-8")
+
+
+# --- Grand-staff notation rendering (validated against hardcoded data in
+# Stages A/B before being wired to real pipeline output here) ---
+
+NOTATION_BEATS_PER_BAR = 4
+NOTATION_SIXTEENTHS_PER_BEAT = 4
+NOTATION_BAR_SIZE = NOTATION_BEATS_PER_BAR * NOTATION_SIXTEENTHS_PER_BEAT  # 16
+
+# (value_in_sixteenths, lilypond_code), largest to smallest. Only values that
+# stay integer on a sixteenth-note grid are included — e.g. double-dotted
+# eighth (3.5) is not representable here and is excluded.
+NOTATION_STANDARD_VALUES = [
+    (16, "1"),    # whole
+    (14, "2.."),  # double-dotted half
+    (12, "2."),   # dotted half
+    (8, "2"),     # half
+    (7, "4.."),   # double-dotted quarter
+    (6, "4."),    # dotted quarter
+    (4, "4"),     # quarter
+    (3, "8."),    # dotted eighth
+    (2, "8"),     # eighth
+    (1, "16"),    # sixteenth
+]
+NOTATION_VALUE_TO_CODE = {value: code for value, code in NOTATION_STANDARD_VALUES}
+
+
+def _largest_fitting_value(n: int) -> int:
+    for value, _ in NOTATION_STANDARD_VALUES:
+        if value <= n:
+            return value
+    raise ValueError(f"no standard duration value fits {n} sixteenths")
+
+
+def _tie_last(pieces: list[tuple[int, bool]]) -> list[tuple[int, bool]]:
+    if not pieces:
+        return pieces
+    last_value, _ = pieces[-1]
+    return pieces[:-1] + [(last_value, True)]
+
+
+def spell_rhythm(
+    start: int,
+    duration: int,
+    beats_per_bar: int = NOTATION_BEATS_PER_BAR,
+    sixteenths_per_beat: int = NOTATION_SIXTEENTHS_PER_BEAT,
+) -> list[tuple[int, bool]]:
+    """Beat-respecting rhythm decomposition, in sixteenth-note integer units.
+
+    Returns [(value_in_sixteenths, is_tied_to_next), ...]. Applies identically
+    to notes and rests (rests just ignore the tie flag when rendered).
+    """
+    if duration <= 0:
+        return []
+
+    bar_size = beats_per_bar * sixteenths_per_beat
+    end = start + duration
+
+    # Rule 1 (strongest): never let a single value cross a bar line.
+    this_bar_end = (start // bar_size + 1) * bar_size
+    if end > this_bar_end:
+        first_len = this_bar_end - start
+        first = spell_rhythm(start, first_len, beats_per_bar, sixteenths_per_beat)
+        rest = spell_rhythm(this_bar_end, end - this_bar_end, beats_per_bar, sixteenths_per_beat)
+        return _tie_last(first) + rest
+
+    # Confined to one bar now.
+    starts_on_beat = start % sixteenths_per_beat == 0
+
+    # Rule 2 (middle): a value starting on a beat boundary can always be
+    # notated as a single standard value (this legally covers dotted/
+    # double-dotted values too — e.g. a dotted quarter starting on a beat is
+    # standard notation even though it extends past the next beat boundary).
+    # Note: this is intentionally wider than "duration is a whole multiple of
+    # a beat" — that stricter gate would incorrectly force a beat-aligned
+    # double-dotted quarter (7 sixteenths, not a whole-beat multiple) to
+    # split into tied pieces instead of rendering as one notehead.
+    if starts_on_beat:
+        value = _largest_fitting_value(duration)
+        if value == duration:
+            return [(value, False)]
+        remainder = duration - value
+        rest = spell_rhythm(start + value, remainder, beats_per_bar, sixteenths_per_beat)
+        return [(value, True)] + rest
+
+    # Rule 2 else-branch: starts mid-beat. If it doesn't cross the next beat
+    # boundary, handle it as a single within-beat greedy pick (rule 3).
+    this_beat_end = (start // sixteenths_per_beat + 1) * sixteenths_per_beat
+    if end <= this_beat_end:
+        value = _largest_fitting_value(duration)
+        if value == duration:
+            return [(value, False)]
+        remainder = duration - value
+        rest = spell_rhythm(start + value, remainder, beats_per_bar, sixteenths_per_beat)
+        return [(value, True)] + rest
+
+    # Crosses the next beat boundary -> split there.
+    first_len = this_beat_end - start
+    first = spell_rhythm(start, first_len, beats_per_bar, sixteenths_per_beat)
+    rest = spell_rhythm(this_beat_end, end - this_beat_end, beats_per_bar, sixteenths_per_beat)
+    return _tie_last(first) + rest
+
+
+NOTE_LETTER_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+_SHARP_SYMBOLS = {"♯", "#"}
+_FLAT_SYMBOLS = {"♭", "b"}
+
+
+def _parse_note_name(note_name: str) -> tuple[str, int, int]:
+    """Returns (letter, accidental_semitones, octave). Handles both the
+    unicode sharp/flat symbols librosa.midi_to_note() actually produces
+    (♯/♭) and plain ASCII (#/b) for robustness."""
+    letter = note_name[0].upper()
+    rest = note_name[1:]
+    accidental = 0
+    if rest and rest[0] in _SHARP_SYMBOLS:
+        accidental = 1
+        rest = rest[1:]
+    elif rest and rest[0] in _FLAT_SYMBOLS:
+        accidental = -1
+        rest = rest[1:]
+    octave = int(rest)
+    return letter, accidental, octave
+
+
+def note_name_to_midi(note_name: str) -> int:
+    letter, accidental, octave = _parse_note_name(note_name)
+    return (octave + 1) * 12 + NOTE_LETTER_SEMITONES[letter] + accidental
+
+
+def note_name_to_lilypond_pitch(note_name: str) -> str:
+    letter, accidental, octave = _parse_note_name(note_name)
+    pitch = letter.lower()
+    # abjad.Staff() parses with language="english" by default, where sharp/flat
+    # are the plain suffixes "s"/"f" (e.g. "cs"=C-sharp) -- NOT the Dutch-style
+    # "is"/"es" used in Stages A/B, which never actually exercised an
+    # accidental and so never caught this. Verified against abjad's own
+    # NamedPitch.number for all seven letters before fixing.
+    if accidental == 1:
+        pitch += "s"
+    elif accidental == -1:
+        pitch += "f"
+    if octave >= 4:
+        pitch += "'" * (octave - 3)
+    elif octave < 3:
+        pitch += "," * (3 - octave)
+    return pitch
+
+
+def _build_staff_input(events: list[dict], is_treble: bool, total_sixteenths: int) -> str:
+    tokens: list[str] = []
+    position = 0
+
+    for event in events:
+        absolute_beat = (event["bar"] - 1) * NOTATION_BEATS_PER_BAR + event["beat_in_bar"]
+        start = round(absolute_beat * NOTATION_SIXTEENTHS_PER_BEAT)
+        # Defensive floor: two very close real onsets can quantize to the same
+        # beat, leaving calculate_note_durations to report a zero/negative gap.
+        # A note can't be notated with zero duration, so floor it to a
+        # sixteenth rather than silently dropping it.
+        duration_beats = max(event["duration_beats"], 0.25)
+        duration_sixteenths = round(duration_beats * NOTATION_SIXTEENTHS_PER_BEAT)
+        end = start + duration_sixteenths
+
+        if start > position:
+            for value, _tied in spell_rhythm(position, start - position):
+                tokens.append(f"r{NOTATION_VALUE_TO_CODE[value]}")
+            position = start
+        elif start < position:
+            # Quantization collapsed this event earlier than where the previous
+            # event already filled to -- nothing sensible to notate, skip it.
+            continue
+
+        pitches = [
+            note_name_to_lilypond_pitch(note["note"])
+            for note in event["notes"]
+            if (note_name_to_midi(note["note"]) >= 60) == is_treble
+        ]
+
+        pieces = spell_rhythm(position, end - position)
+        if pitches:
+            # Multiple notes on one staff (e.g. two notes in different octaves
+            # both landing treble) render as a normal simultaneous chord.
+            pitch_str = pitches[0] if len(pitches) == 1 else "<" + " ".join(pitches) + ">"
+            for value, tied in pieces:
+                tie = "~" if tied else ""
+                tokens.append(f"{pitch_str}{NOTATION_VALUE_TO_CODE[value]}{tie}")
+        else:
+            for value, _tied in pieces:
+                tokens.append(f"r{NOTATION_VALUE_TO_CODE[value]}")
+        position = end
+
+    if total_sixteenths > position:
+        for value, _tied in spell_rhythm(position, total_sixteenths - position):
+            tokens.append(f"r{NOTATION_VALUE_TO_CODE[value]}")
+        position = total_sixteenths
+
+    return " ".join(tokens) if tokens else f"r{NOTATION_VALUE_TO_CODE[NOTATION_BAR_SIZE]}"
+
+
+def generate_notation_pdf(events: list[dict], output_path: Path) -> None:
+    if events:
+        last_event = events[-1]
+        last_start_beats = (last_event["bar"] - 1) * NOTATION_BEATS_PER_BAR + last_event["beat_in_bar"]
+        total_beats_needed = last_start_beats + max(last_event["duration_beats"], 0.25)
+    else:
+        total_beats_needed = 0
+
+    total_sixteenths_needed = total_beats_needed * NOTATION_SIXTEENTHS_PER_BEAT
+    total_sixteenths = max(
+        NOTATION_BAR_SIZE,
+        math.ceil(total_sixteenths_needed / NOTATION_BAR_SIZE) * NOTATION_BAR_SIZE,
+    )
+
+    treble_input = _build_staff_input(events, is_treble=True, total_sixteenths=total_sixteenths)
+    bass_input = _build_staff_input(events, is_treble=False, total_sixteenths=total_sixteenths)
+
+    treble_staff = abjad.Staff(treble_input, name="Treble")
+    bass_staff = abjad.Staff(bass_input, name="Bass")
+
+    abjad.attach(abjad.Clef("treble"), abjad.select.leaves(treble_staff)[0])
+    abjad.attach(abjad.TimeSignature((4, 4)), abjad.select.leaves(treble_staff)[0])
+    abjad.attach(abjad.Clef("bass"), abjad.select.leaves(bass_staff)[0])
+    abjad.attach(abjad.TimeSignature((4, 4)), abjad.select.leaves(bass_staff)[0])
+
+    piano_staff_group = abjad.StaffGroup(
+        [treble_staff, bass_staff], lilypond_type="PianoStaff", name="Piano"
+    )
+    score = abjad.Score([piano_staff_group], name="Score")
+    lilypond_file = abjad.LilyPondFile([score])
+
+    abjad.persist.as_pdf(lilypond_file, str(output_path))
 
 
 def extract_frame_at_time(video_path: Path, timestamp_seconds: float) -> np.ndarray | None:
@@ -399,6 +633,26 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     filtered_events = filter_event_notes(events)
     filtered_events = suppress_decay_tail_notes(filtered_events)
 
+    # Reintegrate bar/beat/duration onto the final (deduped/grouped/filtered)
+    # events -- these functions predate the basic-pitch migration and were
+    # unused dead code since then; the event structure they operate on
+    # (a plain list of onset times) is unchanged, so this is a direct
+    # drop-in against event_times instead of the old CQT event onsets.
+    event_times = [event["event_time"] for event in filtered_events]
+    detected_beats = convert_seconds_to_beats(event_times, tempo_bpm)
+    quantized_beats = quantize_beats(detected_beats)
+    detected_bars, measure_beats = calculate_bar_structures(quantized_beats)
+    total_duration_beats = duration_seconds * (tempo_bpm / 60.0)
+    note_durations, note_types = calculate_note_durations(quantized_beats, total_duration_beats)
+
+    for event, bar, beat_in_bar, duration_beats, note_type in zip(
+        filtered_events, detected_bars, measure_beats, note_durations, note_types
+    ):
+        event["bar"] = bar
+        event["beat_in_bar"] = beat_in_bar
+        event["duration_beats"] = duration_beats
+        event["note_type"] = note_type
+
     # Sanity-check the audio-to-video frame targeting math against the first
     # few note onsets before it's relied on for real multimodal analysis.
     for note in notes[:3]:
@@ -472,7 +726,7 @@ async def transcribe(file: UploadFile):
 
     pdf_filename = f"{file_id}.pdf"
     musicxml_filename = f"{file_id}.musicxml"
-    generate_placeholder_pdf(UPLOAD_DIR / pdf_filename, file.filename or "Piano Transcriber")
+    generate_notation_pdf(audio_analysis["events"], UPLOAD_DIR / pdf_filename)
     generate_placeholder_musicxml(UPLOAD_DIR / musicxml_filename)
 
     return {
