@@ -360,6 +360,25 @@ def quantize_beats(detected_beats: list[float], resolution: float = 0.25) -> lis
     return [round(round(beat / resolution) * resolution, 2) for beat in detected_beats]
 
 
+def select_best_quantization_resolution(
+    detected_beats: list[float],
+    candidate_resolutions: list[float] = [1.0, 0.5, 0.25],
+    fit_tolerance_fraction: float = 0.3,
+) -> float:
+    for resolution in candidate_resolutions:
+        quantized = quantize_beats(detected_beats, resolution=resolution)
+        deviations = [abs(beat - q) for beat, q in zip(detected_beats, quantized)]
+        average_deviation = sum(deviations) / len(deviations) if deviations else 0.0
+        # A resolution that fits on average can still collapse two distinct
+        # onsets onto the same beat -- that's not "denser than ideal", it's
+        # wrong, so any collision disqualifies the resolution outright.
+        collides = len(set(quantized)) != len(quantized)
+        if average_deviation <= fit_tolerance_fraction * resolution and not collides:
+            return resolution
+
+    return min(candidate_resolutions)
+
+
 def calculate_bar_structures(
     quantized_beats: list[float], beats_per_bar: int = 4
 ) -> tuple[list[int], list[float]]:
@@ -640,7 +659,8 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     # drop-in against event_times instead of the old CQT event onsets.
     event_times = [event["event_time"] for event in filtered_events]
     detected_beats = convert_seconds_to_beats(event_times, tempo_bpm)
-    quantized_beats = quantize_beats(detected_beats)
+    resolution = select_best_quantization_resolution(detected_beats)
+    quantized_beats = quantize_beats(detected_beats, resolution=resolution)
     detected_bars, measure_beats = calculate_bar_structures(quantized_beats)
     total_duration_beats = duration_seconds * (tempo_bpm / 60.0)
     note_durations, note_types = calculate_note_durations(quantized_beats, total_duration_beats)
@@ -669,6 +689,7 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
         "tempo_bpm": round(tempo_bpm, 1),
         "raw_notes": notes,
         "events": filtered_events,
+        "quantization_resolution": resolution,
     }
 
 
