@@ -27,6 +27,10 @@ type EventData = {
 const ACCEPTED_TYPES = ["video/mp4", "video/quicktime", "video/x-m4v"];
 const API_BASE = "http://localhost:8000";
 
+type TimeSignatureMode = "auto" | "specify";
+const SIMPLE_METERS = ["4/4", "3/4", "2/4"];
+const COMPOUND_METERS = ["6/8", "9/8", "12/8"];
+
 export default function Home() {
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState(0);
@@ -41,6 +45,12 @@ export default function Home() {
   const [rawNotes, setRawNotes] = useState<RawNote[]>([]);
   const [events, setEvents] = useState<EventData[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [timeSignatureMode, setTimeSignatureMode] = useState<TimeSignatureMode>("auto");
+  const [simpleMeter, setSimpleMeter] = useState("");
+  const [compoundMeter, setCompoundMeter] = useState("");
+  const [tempoBpmInput, setTempoBpmInput] = useState("");
+  const [hasPickup, setHasPickup] = useState(false);
+  const [pickupBeatsInput, setPickupBeatsInput] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -93,6 +103,26 @@ export default function Home() {
       const formData = new FormData();
       formData.append("file", file);
 
+      if (timeSignatureMode === "specify") {
+        const chosenMeter = simpleMeter || compoundMeter;
+        if (chosenMeter) {
+          formData.append("time_signature", chosenMeter);
+        }
+      }
+
+      const parsedTempo = tempoBpmInput.trim() === "" ? null : Number(tempoBpmInput);
+      if (parsedTempo !== null && !Number.isNaN(parsedTempo)) {
+        formData.append("tempo_bpm", String(parsedTempo));
+      }
+
+      formData.append("has_pickup", hasPickup ? "true" : "false");
+      if (hasPickup) {
+        const parsedPickup = pickupBeatsInput.trim() === "" ? null : Number(pickupBeatsInput);
+        if (parsedPickup !== null && !Number.isNaN(parsedPickup)) {
+          formData.append("pickup_beats", String(parsedPickup));
+        }
+      }
+
       const response = await fetch(`${API_BASE}/api/transcribe`, {
         method: "POST",
         body: formData,
@@ -131,7 +161,7 @@ export default function Home() {
         err instanceof Error ? err.message : "Something went wrong while uploading."
       );
     }
-  }, []);
+  }, [timeSignatureMode, simpleMeter, compoundMeter, tempoBpmInput, hasPickup, pickupBeatsInput]);
 
   const handleDrop = useCallback(
     (e: React.DragEvent<HTMLDivElement>) => {
@@ -319,6 +349,154 @@ export default function Home() {
             Upload a video of a piano performance to generate sheet music.
           </p>
         </div>
+
+        {!isBusy && (
+          <div className="mb-6 rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
+            <h2 className="text-sm font-semibold text-gray-900">
+              Optional: help us get the rhythm right
+            </h2>
+            <p className="mt-1 text-xs text-gray-500">
+              Auto-detected tempo and time signature can be off, especially on short clips. Fill
+              in what you know, or leave everything on auto-detect.
+            </p>
+
+            <div className="mt-4">
+              <span className="block text-xs font-medium uppercase tracking-wide text-gray-500">
+                Time signature
+              </span>
+              <div className="mt-2 flex gap-4">
+                <label className="flex items-center gap-2 text-sm text-gray-700">
+                  <input
+                    type="radio"
+                    name="time-signature-mode"
+                    checked={timeSignatureMode === "auto"}
+                    onChange={() => {
+                      setTimeSignatureMode("auto");
+                      setSimpleMeter("");
+                      setCompoundMeter("");
+                    }}
+                  />
+                  Auto-detect
+                </label>
+                <label className="flex items-center gap-2 text-sm text-gray-700">
+                  <input
+                    type="radio"
+                    name="time-signature-mode"
+                    checked={timeSignatureMode === "specify"}
+                    onChange={() => setTimeSignatureMode("specify")}
+                  />
+                  I&apos;ll specify
+                </label>
+              </div>
+
+              {timeSignatureMode === "specify" && (
+                <div className="mt-3 grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-gray-500">Simple meters</label>
+                    <select
+                      value={simpleMeter}
+                      onChange={(e) => {
+                        setSimpleMeter(e.target.value);
+                        setCompoundMeter("");
+                      }}
+                      className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900"
+                    >
+                      <option value="">—</option>
+                      {SIMPLE_METERS.map((meter) => (
+                        <option key={meter} value={meter}>
+                          {meter}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500">Compound meters</label>
+                    <select
+                      value={compoundMeter}
+                      onChange={(e) => {
+                        setCompoundMeter(e.target.value);
+                        setSimpleMeter("");
+                      }}
+                      className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900"
+                    >
+                      <option value="">—</option>
+                      {COMPOUND_METERS.map((meter) => (
+                        <option key={meter} value={meter}>
+                          {meter}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-4">
+              <label className="block text-xs font-medium uppercase tracking-wide text-gray-500">
+                Tempo (BPM)
+              </label>
+              <input
+                type="number"
+                inputMode="decimal"
+                value={tempoBpmInput}
+                onChange={(e) => setTempoBpmInput(e.target.value)}
+                placeholder="leave blank to auto-detect"
+                className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400"
+              />
+              {compoundMeter !== "" && (
+                <p className="mt-1 text-xs text-gray-500">
+                  For compound meters, enter the dotted-quarter-note tempo (e.g. the
+                  &quot;quarter-note-dot equals X&quot; marking).
+                </p>
+              )}
+            </div>
+
+            <div className="mt-4">
+              <span className="block text-xs font-medium uppercase tracking-wide text-gray-500">
+                Pickup measure
+              </span>
+              <div className="mt-2 flex gap-4">
+                <label className="flex items-center gap-2 text-sm text-gray-700">
+                  <input
+                    type="radio"
+                    name="has-pickup"
+                    checked={!hasPickup}
+                    onChange={() => {
+                      setHasPickup(false);
+                      setPickupBeatsInput("");
+                    }}
+                  />
+                  No
+                </label>
+                <label className="flex items-center gap-2 text-sm text-gray-700">
+                  <input
+                    type="radio"
+                    name="has-pickup"
+                    checked={hasPickup}
+                    onChange={() => setHasPickup(true)}
+                  />
+                  Yes
+                </label>
+              </div>
+
+              {hasPickup && (
+                <div className="mt-3">
+                  <label className="block text-xs text-gray-500">
+                    How many beats is the pickup?
+                  </label>
+                  <input
+                    type="number"
+                    inputMode="decimal"
+                    value={pickupBeatsInput}
+                    onChange={(e) => setPickupBeatsInput(e.target.value)}
+                    placeholder="leave blank if unsure"
+                    className="mt-1 w-full max-w-[10rem] rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400"
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         <div
           onDragOver={(e) => {

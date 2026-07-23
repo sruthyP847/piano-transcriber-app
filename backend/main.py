@@ -8,7 +8,7 @@ import librosa
 import numpy as np
 from basic_pitch import ICASSP_2022_MODEL_PATH
 from basic_pitch.inference import predict
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from moviepy import VideoFileClip
@@ -142,7 +142,7 @@ def _tie_last(pieces: list[tuple[int, bool]]) -> list[tuple[int, bool]]:
 def spell_rhythm(
     start: int,
     duration: int,
-    beats_per_bar: int = NOTATION_BEATS_PER_BAR,
+    beats_per_bar: float = NOTATION_BEATS_PER_BAR,
     sixteenths_per_beat: int = NOTATION_SIXTEENTHS_PER_BEAT,
 ) -> list[tuple[int, bool]]:
     """Beat-respecting rhythm decomposition, in sixteenth-note integer units.
@@ -153,7 +153,10 @@ def spell_rhythm(
     if duration <= 0:
         return []
 
-    bar_size = beats_per_bar * sixteenths_per_beat
+    # beats_per_bar can be non-integer for compound meters (e.g. 6/8 -> 3.0
+    # quarter-note-equivalent beats), but the product with sixteenths_per_beat
+    # is always a whole number of sixteenths for the meters this app supports.
+    bar_size = round(beats_per_bar * sixteenths_per_beat)
     end = start + duration
 
     # Rule 1 (strongest): never let a single value cross a bar line.
@@ -247,12 +250,28 @@ def note_name_to_lilypond_pitch(note_name: str) -> str:
     return pitch
 
 
-def _build_staff_input(events: list[dict], is_treble: bool, total_sixteenths: int) -> str:
+def _absolute_beat(event: dict, bar_length_beats: float, pickup_beats: float | None) -> float:
+    """Inverse of calculate_bar_structures' (bar, beat_in_bar) assignment --
+    must stay in sync with it or note positions and bar boundaries diverge."""
+    if pickup_beats is not None and event["bar"] == 1:
+        return event["beat_in_bar"]
+    base = pickup_beats if pickup_beats is not None else 0
+    bar_offset = event["bar"] - (2 if pickup_beats is not None else 1)
+    return base + bar_offset * bar_length_beats + event["beat_in_bar"]
+
+
+def _build_staff_input(
+    events: list[dict],
+    is_treble: bool,
+    total_sixteenths: int,
+    bar_length_beats: float = NOTATION_BEATS_PER_BAR,
+    pickup_beats: float | None = None,
+) -> str:
     tokens: list[str] = []
     position = 0
 
     for event in events:
-        absolute_beat = (event["bar"] - 1) * NOTATION_BEATS_PER_BAR + event["beat_in_bar"]
+        absolute_beat = _absolute_beat(event, bar_length_beats, pickup_beats)
         start = round(absolute_beat * NOTATION_SIXTEENTHS_PER_BEAT)
         # Defensive floor: two very close real onsets can quantize to the same
         # beat, leaving calculate_note_durations to report a zero/negative gap.
@@ -263,7 +282,7 @@ def _build_staff_input(events: list[dict], is_treble: bool, total_sixteenths: in
         end = start + duration_sixteenths
 
         if start > position:
-            for value, _tied in spell_rhythm(position, start - position):
+            for value, _tied in spell_rhythm(position, start - position, bar_length_beats):
                 tokens.append(f"r{NOTATION_VALUE_TO_CODE[value]}")
             position = start
         elif start < position:
@@ -277,7 +296,7 @@ def _build_staff_input(events: list[dict], is_treble: bool, total_sixteenths: in
             if (note_name_to_midi(note["note"]) >= 60) == is_treble
         ]
 
-        pieces = spell_rhythm(position, end - position)
+        pieces = spell_rhythm(position, end - position, bar_length_beats)
         if pitches:
             # Multiple notes on one staff (e.g. two notes in different octaves
             # both landing treble) render as a normal simultaneous chord.
@@ -291,37 +310,57 @@ def _build_staff_input(events: list[dict], is_treble: bool, total_sixteenths: in
         position = end
 
     if total_sixteenths > position:
-        for value, _tied in spell_rhythm(position, total_sixteenths - position):
+        for value, _tied in spell_rhythm(position, total_sixteenths - position, bar_length_beats):
             tokens.append(f"r{NOTATION_VALUE_TO_CODE[value]}")
         position = total_sixteenths
 
     return " ".join(tokens) if tokens else f"r{NOTATION_VALUE_TO_CODE[NOTATION_BAR_SIZE]}"
 
 
-def generate_notation_pdf(events: list[dict], output_path: Path) -> None:
+def generate_notation_pdf(
+    events: list[dict],
+    output_path: Path,
+    time_signature: tuple[int, int] = (4, 4),
+    pickup_beats: float | None = None,
+) -> None:
+    bar_length_beats = time_signature_bar_length_beats(*time_signature)
+    bar_size_sixteenths = round(bar_length_beats * NOTATION_SIXTEENTHS_PER_BEAT)
+
     if events:
         last_event = events[-1]
-        last_start_beats = (last_event["bar"] - 1) * NOTATION_BEATS_PER_BAR + last_event["beat_in_bar"]
+        last_start_beats = _absolute_beat(last_event, bar_length_beats, pickup_beats)
         total_beats_needed = last_start_beats + max(last_event["duration_beats"], 0.25)
     else:
         total_beats_needed = 0
 
     total_sixteenths_needed = total_beats_needed * NOTATION_SIXTEENTHS_PER_BEAT
     total_sixteenths = max(
-        NOTATION_BAR_SIZE,
-        math.ceil(total_sixteenths_needed / NOTATION_BAR_SIZE) * NOTATION_BAR_SIZE,
+        bar_size_sixteenths,
+        math.ceil(total_sixteenths_needed / bar_size_sixteenths) * bar_size_sixteenths,
     )
 
-    treble_input = _build_staff_input(events, is_treble=True, total_sixteenths=total_sixteenths)
-    bass_input = _build_staff_input(events, is_treble=False, total_sixteenths=total_sixteenths)
+    treble_input = _build_staff_input(
+        events,
+        is_treble=True,
+        total_sixteenths=total_sixteenths,
+        bar_length_beats=bar_length_beats,
+        pickup_beats=pickup_beats,
+    )
+    bass_input = _build_staff_input(
+        events,
+        is_treble=False,
+        total_sixteenths=total_sixteenths,
+        bar_length_beats=bar_length_beats,
+        pickup_beats=pickup_beats,
+    )
 
     treble_staff = abjad.Staff(treble_input, name="Treble")
     bass_staff = abjad.Staff(bass_input, name="Bass")
 
     abjad.attach(abjad.Clef("treble"), abjad.select.leaves(treble_staff)[0])
-    abjad.attach(abjad.TimeSignature((4, 4)), abjad.select.leaves(treble_staff)[0])
+    abjad.attach(abjad.TimeSignature(time_signature), abjad.select.leaves(treble_staff)[0])
     abjad.attach(abjad.Clef("bass"), abjad.select.leaves(bass_staff)[0])
-    abjad.attach(abjad.TimeSignature((4, 4)), abjad.select.leaves(bass_staff)[0])
+    abjad.attach(abjad.TimeSignature(time_signature), abjad.select.leaves(bass_staff)[0])
 
     piano_staff_group = abjad.StaffGroup(
         [treble_staff, bass_staff], lilypond_type="PianoStaff", name="Piano"
@@ -379,15 +418,40 @@ def select_best_quantization_resolution(
     return min(candidate_resolutions)
 
 
+COMPOUND_TIME_SIGNATURES = {"6/8", "9/8", "12/8"}
+
+
+def parse_time_signature(time_signature: str) -> tuple[int, int]:
+    numerator_str, denominator_str = time_signature.split("/")
+    return int(numerator_str), int(denominator_str)
+
+
+def time_signature_bar_length_beats(numerator: int, denominator: int) -> float:
+    """Bar length in quarter-note-equivalent beats -- e.g. 6/8 -> 3.0."""
+    return numerator * 4 / denominator
+
+
 def calculate_bar_structures(
-    quantized_beats: list[float], beats_per_bar: int = 4
+    quantized_beats: list[float],
+    bar_length_beats: float = 4.0,
+    pickup_beats: float | None = None,
 ) -> tuple[list[int], list[float]]:
     detected_bars = []
     measure_beats = []
 
     for beat in quantized_beats:
-        bar_number = int(beat // beats_per_bar) + 1
-        beat_in_bar = round(beat % beats_per_bar, 2)
+        if pickup_beats is not None and beat < pickup_beats:
+            bar_number = 1
+            beat_in_bar = round(beat, 2)
+        else:
+            # With a pickup, bar 1 is the (shorter) pickup measure and bar 2
+            # onward are full bars -- offset past the pickup before doing the
+            # normal full-bar division. Without a pickup this is equivalent
+            # to the original beat // bar_length_beats math.
+            offset = beat - pickup_beats if pickup_beats is not None else beat
+            bar_index = int(offset // bar_length_beats)
+            bar_number = (2 if pickup_beats is not None else 1) + bar_index
+            beat_in_bar = round(offset % bar_length_beats, 2)
         detected_bars.append(bar_number)
         measure_beats.append(beat_in_bar)
 
@@ -637,14 +701,40 @@ def suppress_decay_tail_notes(events: list[dict]) -> list[dict]:
     return result
 
 
-def analyze_audio(audio_path: Path, video_path: Path) -> dict:
+def analyze_audio(
+    audio_path: Path,
+    video_path: Path,
+    time_signature: str | None = None,
+    tempo_bpm_override: float | None = None,
+    has_pickup: bool = False,
+    pickup_beats: float | None = None,
+) -> dict:
     # sr=None preserves the file's native sample rate instead of resampling to 22.05kHz.
     waveform, sample_rate = librosa.load(str(audio_path), sr=None)
     duration_seconds = librosa.get_duration(y=waveform, sr=sample_rate)
-    tempo, _ = librosa.beat.beat_track(y=waveform, sr=sample_rate)
 
-    # librosa returns tempo as a 1-element array rather than a bare scalar.
-    tempo_bpm = float(np.asarray(tempo).reshape(-1)[0])
+    if time_signature:
+        numerator, denominator = parse_time_signature(time_signature)
+    else:
+        # "Auto" doesn't attempt time-signature detection (a separate, harder
+        # problem) -- it just assumes 4/4, matching prior behavior exactly.
+        numerator, denominator = 4, 4
+    bar_length_beats = time_signature_bar_length_beats(numerator, denominator)
+    is_compound = time_signature in COMPOUND_TIME_SIGNATURES
+
+    if tempo_bpm_override is not None:
+        # A compound-meter tempo marking is conventionally given as the
+        # dotted-quarter-note value; internally everything is quarter-note
+        # beats, so convert (dotted quarter = 1.5 quarter notes) before use.
+        tempo_bpm = tempo_bpm_override * 1.5 if is_compound else tempo_bpm_override
+        tempo_source = "user"
+    else:
+        tempo, _ = librosa.beat.beat_track(y=waveform, sr=sample_rate)
+        # librosa returns tempo as a 1-element array rather than a bare scalar.
+        tempo_bpm = float(np.asarray(tempo).reshape(-1)[0])
+        tempo_source = "auto"
+
+    effective_pickup_beats = pickup_beats if has_pickup else None
 
     notes = detect_notes_basic_pitch(audio_path)
     deduped = deduplicate_notes(notes)
@@ -661,7 +751,9 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
     detected_beats = convert_seconds_to_beats(event_times, tempo_bpm)
     resolution = select_best_quantization_resolution(detected_beats)
     quantized_beats = quantize_beats(detected_beats, resolution=resolution)
-    detected_bars, measure_beats = calculate_bar_structures(quantized_beats)
+    detected_bars, measure_beats = calculate_bar_structures(
+        quantized_beats, bar_length_beats=bar_length_beats, pickup_beats=effective_pickup_beats
+    )
     total_duration_beats = duration_seconds * (tempo_bpm / 60.0)
     note_durations, note_types = calculate_note_durations(quantized_beats, total_duration_beats)
 
@@ -690,6 +782,10 @@ def analyze_audio(audio_path: Path, video_path: Path) -> dict:
         "raw_notes": notes,
         "events": filtered_events,
         "quantization_resolution": resolution,
+        "time_signature": f"{numerator}/{denominator}",
+        "tempo_source": tempo_source,
+        "has_pickup": has_pickup,
+        "pickup_beats": effective_pickup_beats,
     }
 
 
@@ -699,7 +795,13 @@ def read_hello():
 
 
 @app.post("/api/transcribe")
-async def transcribe(file: UploadFile):
+async def transcribe(
+    file: UploadFile,
+    time_signature: str | None = Form(None),
+    tempo_bpm: float | None = Form(None),
+    has_pickup: bool = Form(False),
+    pickup_beats: float | None = Form(None),
+):
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
             status_code=400,
@@ -743,11 +845,23 @@ async def transcribe(file: UploadFile):
         if video_clip is not None:
             video_clip.close()
 
-    audio_analysis = analyze_audio(audio_destination, destination)
+    audio_analysis = analyze_audio(
+        audio_destination,
+        destination,
+        time_signature=time_signature,
+        tempo_bpm_override=tempo_bpm,
+        has_pickup=has_pickup,
+        pickup_beats=pickup_beats,
+    )
 
     pdf_filename = f"{file_id}.pdf"
     musicxml_filename = f"{file_id}.musicxml"
-    generate_notation_pdf(audio_analysis["events"], UPLOAD_DIR / pdf_filename)
+    generate_notation_pdf(
+        audio_analysis["events"],
+        UPLOAD_DIR / pdf_filename,
+        time_signature=parse_time_signature(audio_analysis["time_signature"]),
+        pickup_beats=audio_analysis["pickup_beats"],
+    )
     generate_placeholder_musicxml(UPLOAD_DIR / musicxml_filename)
 
     return {
