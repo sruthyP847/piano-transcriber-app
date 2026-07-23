@@ -115,13 +115,8 @@ export default function Home() {
         formData.append("tempo_bpm", String(parsedTempo));
       }
 
-      formData.append("has_pickup", hasPickup ? "true" : "false");
-      if (hasPickup) {
-        const parsedPickup = pickupBeatsInput.trim() === "" ? null : Number(pickupBeatsInput);
-        if (parsedPickup !== null && !Number.isNaN(parsedPickup)) {
-          formData.append("pickup_beats", String(parsedPickup));
-        }
-      }
+      // Pickup-measure UI stays interactive, but the backend doesn't support
+      // it yet -- has_pickup/pickup_beats are intentionally not sent.
 
       const response = await fetch(`${API_BASE}/api/transcribe`, {
         method: "POST",
@@ -161,7 +156,7 @@ export default function Home() {
         err instanceof Error ? err.message : "Something went wrong while uploading."
       );
     }
-  }, [timeSignatureMode, simpleMeter, compoundMeter, tempoBpmInput, hasPickup, pickupBeatsInput]);
+  }, [timeSignatureMode, simpleMeter, compoundMeter, tempoBpmInput]);
 
   const handleDrop = useCallback(
     (e: React.DragEvent<HTMLDivElement>) => {
@@ -490,7 +485,7 @@ export default function Home() {
                     value={pickupBeatsInput}
                     onChange={(e) => setPickupBeatsInput(e.target.value)}
                     placeholder="leave blank if unsure"
-                    className="mt-1 w-full max-w-[10rem] rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400"
+                    className="mt-1 w-full max-w-40 rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400"
                   />
                 </div>
               )}

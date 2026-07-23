@@ -250,28 +250,17 @@ def note_name_to_lilypond_pitch(note_name: str) -> str:
     return pitch
 
 
-def _absolute_beat(event: dict, bar_length_beats: float, pickup_beats: float | None) -> float:
-    """Inverse of calculate_bar_structures' (bar, beat_in_bar) assignment --
-    must stay in sync with it or note positions and bar boundaries diverge."""
-    if pickup_beats is not None and event["bar"] == 1:
-        return event["beat_in_bar"]
-    base = pickup_beats if pickup_beats is not None else 0
-    bar_offset = event["bar"] - (2 if pickup_beats is not None else 1)
-    return base + bar_offset * bar_length_beats + event["beat_in_bar"]
-
-
 def _build_staff_input(
     events: list[dict],
     is_treble: bool,
     total_sixteenths: int,
     bar_length_beats: float = NOTATION_BEATS_PER_BAR,
-    pickup_beats: float | None = None,
 ) -> str:
     tokens: list[str] = []
     position = 0
 
     for event in events:
-        absolute_beat = _absolute_beat(event, bar_length_beats, pickup_beats)
+        absolute_beat = (event["bar"] - 1) * bar_length_beats + event["beat_in_bar"]
         start = round(absolute_beat * NOTATION_SIXTEENTHS_PER_BEAT)
         # Defensive floor: two very close real onsets can quantize to the same
         # beat, leaving calculate_note_durations to report a zero/negative gap.
@@ -321,14 +310,13 @@ def generate_notation_pdf(
     events: list[dict],
     output_path: Path,
     time_signature: tuple[int, int] = (4, 4),
-    pickup_beats: float | None = None,
 ) -> None:
     bar_length_beats = time_signature_bar_length_beats(*time_signature)
     bar_size_sixteenths = round(bar_length_beats * NOTATION_SIXTEENTHS_PER_BEAT)
 
     if events:
         last_event = events[-1]
-        last_start_beats = _absolute_beat(last_event, bar_length_beats, pickup_beats)
+        last_start_beats = (last_event["bar"] - 1) * bar_length_beats + last_event["beat_in_bar"]
         total_beats_needed = last_start_beats + max(last_event["duration_beats"], 0.25)
     else:
         total_beats_needed = 0
@@ -344,14 +332,12 @@ def generate_notation_pdf(
         is_treble=True,
         total_sixteenths=total_sixteenths,
         bar_length_beats=bar_length_beats,
-        pickup_beats=pickup_beats,
     )
     bass_input = _build_staff_input(
         events,
         is_treble=False,
         total_sixteenths=total_sixteenths,
         bar_length_beats=bar_length_beats,
-        pickup_beats=pickup_beats,
     )
 
     treble_staff = abjad.Staff(treble_input, name="Treble")
@@ -432,26 +418,14 @@ def time_signature_bar_length_beats(numerator: int, denominator: int) -> float:
 
 
 def calculate_bar_structures(
-    quantized_beats: list[float],
-    bar_length_beats: float = 4.0,
-    pickup_beats: float | None = None,
+    quantized_beats: list[float], bar_length_beats: float = 4.0
 ) -> tuple[list[int], list[float]]:
     detected_bars = []
     measure_beats = []
 
     for beat in quantized_beats:
-        if pickup_beats is not None and beat < pickup_beats:
-            bar_number = 1
-            beat_in_bar = round(beat, 2)
-        else:
-            # With a pickup, bar 1 is the (shorter) pickup measure and bar 2
-            # onward are full bars -- offset past the pickup before doing the
-            # normal full-bar division. Without a pickup this is equivalent
-            # to the original beat // bar_length_beats math.
-            offset = beat - pickup_beats if pickup_beats is not None else beat
-            bar_index = int(offset // bar_length_beats)
-            bar_number = (2 if pickup_beats is not None else 1) + bar_index
-            beat_in_bar = round(offset % bar_length_beats, 2)
+        bar_number = int(beat // bar_length_beats) + 1
+        beat_in_bar = round(beat % bar_length_beats, 2)
         detected_bars.append(bar_number)
         measure_beats.append(beat_in_bar)
 
@@ -706,8 +680,6 @@ def analyze_audio(
     video_path: Path,
     time_signature: str | None = None,
     tempo_bpm_override: float | None = None,
-    has_pickup: bool = False,
-    pickup_beats: float | None = None,
 ) -> dict:
     # sr=None preserves the file's native sample rate instead of resampling to 22.05kHz.
     waveform, sample_rate = librosa.load(str(audio_path), sr=None)
@@ -734,8 +706,6 @@ def analyze_audio(
         tempo_bpm = float(np.asarray(tempo).reshape(-1)[0])
         tempo_source = "auto"
 
-    effective_pickup_beats = pickup_beats if has_pickup else None
-
     notes = detect_notes_basic_pitch(audio_path)
     deduped = deduplicate_notes(notes)
     events = group_notes_into_events(deduped)
@@ -752,7 +722,7 @@ def analyze_audio(
     resolution = select_best_quantization_resolution(detected_beats)
     quantized_beats = quantize_beats(detected_beats, resolution=resolution)
     detected_bars, measure_beats = calculate_bar_structures(
-        quantized_beats, bar_length_beats=bar_length_beats, pickup_beats=effective_pickup_beats
+        quantized_beats, bar_length_beats=bar_length_beats
     )
     total_duration_beats = duration_seconds * (tempo_bpm / 60.0)
     note_durations, note_types = calculate_note_durations(quantized_beats, total_duration_beats)
@@ -784,8 +754,6 @@ def analyze_audio(
         "quantization_resolution": resolution,
         "time_signature": f"{numerator}/{denominator}",
         "tempo_source": tempo_source,
-        "has_pickup": has_pickup,
-        "pickup_beats": effective_pickup_beats,
     }
 
 
@@ -799,8 +767,6 @@ async def transcribe(
     file: UploadFile,
     time_signature: str | None = Form(None),
     tempo_bpm: float | None = Form(None),
-    has_pickup: bool = Form(False),
-    pickup_beats: float | None = Form(None),
 ):
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
@@ -850,8 +816,6 @@ async def transcribe(
         destination,
         time_signature=time_signature,
         tempo_bpm_override=tempo_bpm,
-        has_pickup=has_pickup,
-        pickup_beats=pickup_beats,
     )
 
     pdf_filename = f"{file_id}.pdf"
@@ -860,7 +824,6 @@ async def transcribe(
         audio_analysis["events"],
         UPLOAD_DIR / pdf_filename,
         time_signature=parse_time_signature(audio_analysis["time_signature"]),
-        pickup_beats=audio_analysis["pickup_beats"],
     )
     generate_placeholder_musicxml(UPLOAD_DIR / musicxml_filename)
 
