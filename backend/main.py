@@ -5,7 +5,10 @@ from pathlib import Path
 import abjad
 import cv2
 import librosa
+import mediapipe as mp
 import numpy as np
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python import vision as mp_vision
 from basic_pitch import ICASSP_2022_MODEL_PATH
 from basic_pitch.inference import predict
 from fastapi import FastAPI, Form, HTTPException, UploadFile
@@ -424,12 +427,49 @@ def _key_geometry(midi: int) -> tuple[str, float, float]:
     return f"{letter}{octave_number}", octave_start + left_offset, BLACK_KEY_WIDTH_FRACTION
 
 
+# --- Perspective-corrected calibration (Stage 1.5) ---
+#
+# Real key DEPTH dimensions, from the same source as the width geometry
+# above (Wikimedia Commons "Pianoteilung.svg"). That diagram carries its
+# own vertical dimension lines and embedded mm labels ("100" and "45") on
+# the depth axis -- an independent measurement channel within the same
+# source. Decoding the raw SVG rect coordinates directly (white key rect:
+# y=3528.82, height=7161.12; black key rect: y=5751.27, height=4938.67;
+# both flush at the back edge y=10689.94) and converting through the same
+# raw-unit-to-mm scale factor established from the width axis (23.6mm per
+# 1165.5 raw units) gives white-only front zone = 45.00mm and black key
+# depth = 100.00mm -- both within 0.001mm of the diagram's own printed
+# labels, confirming the decode rather than coincidence.
+# Cross-validated against a second, independent source: a PianoWorld forum
+# thread (https://forum.pianoworld.com/ubbthreads.php/topics/154457.html)
+# with real grand-piano fallboard-to-tip measurements -- Schimmel CC213
+# and Estonia grands at 5 7/8" (149.2mm), Baldwin Model L at 5 5/8"
+# (142.9mm). This diagram's total white key depth (45+100=145mm) falls
+# squarely inside that real-world 142.9-149.2mm range.
+WHITE_KEY_TOTAL_DEPTH_MM = 145.0
+BLACK_KEY_DEPTH_MM = 100.0
+WHITE_ONLY_ZONE_DEPTH_MM = WHITE_KEY_TOTAL_DEPTH_MM - BLACK_KEY_DEPTH_MM  # 45.0
+WHITE_KEY_WIDTH_MM = 23.6  # DIN 8995, established in Stage 1
+
+# Canonical 2D physical keyboard space, in white-key-width (W) units for
+# both axes: u = lateral position (Stage 1's model, unchanged), v = depth
+# from the front edge (v=0) toward the back of the visible keybed.
+TOTAL_DEPTH_W = WHITE_KEY_TOTAL_DEPTH_MM / WHITE_KEY_WIDTH_MM  # ~6.144
+WHITE_ONLY_ZONE_DEPTH_W = WHITE_ONLY_ZONE_DEPTH_MM / WHITE_KEY_WIDTH_MM  # ~1.907
+
+
 def build_keyboard_calibration(
     leftmost_note: str,
     rightmost_note: str,
-    keyboard_pixel_left: float,
-    keyboard_pixel_right: float,
+    front_left_px: tuple[float, float],
+    front_right_px: tuple[float, float],
+    back_left_px: tuple[float, float],
+    back_right_px: tuple[float, float],
 ) -> dict:
+    """Perspective-corrected calibration (Stage 1.5) -- supersedes Stage 1's
+    2-point horizontal-only version, which assumed an overhead camera and
+    couldn't distinguish "over a white key" from "over a black key" by
+    depth. Takes the visible keybed's 4 real corners instead of 2 edges."""
     leftmost_midi = note_name_to_midi(leftmost_note)
     rightmost_midi = note_name_to_midi(rightmost_note)
     if rightmost_midi <= leftmost_midi:
@@ -437,41 +477,241 @@ def build_keyboard_calibration(
 
     _, left_anchor_offset, _ = _key_geometry(leftmost_midi)
     _, right_anchor_offset, right_anchor_width = _key_geometry(rightmost_midi)
-    span_in_white_widths = (right_anchor_offset + right_anchor_width) - left_anchor_offset
-    pixels_per_white_width = (keyboard_pixel_right - keyboard_pixel_left) / span_in_white_widths
+    u_left = left_anchor_offset
+    u_right = right_anchor_offset + right_anchor_width
 
-    def offset_to_pixel(offset_in_white_widths: float) -> float:
-        return keyboard_pixel_left + (offset_in_white_widths - left_anchor_offset) * pixels_per_white_width
+    src_px = np.array([front_left_px, front_right_px, back_left_px, back_right_px], dtype=np.float32)
+    dst_canonical = np.array(
+        [[u_left, 0.0], [u_right, 0.0], [u_left, TOTAL_DEPTH_W], [u_right, TOTAL_DEPTH_W]],
+        dtype=np.float32,
+    )
+    pixel_to_canonical_matrix = cv2.getPerspectiveTransform(src_px, dst_canonical)
+    canonical_to_pixel_matrix = cv2.getPerspectiveTransform(dst_canonical, src_px)
 
-    keys = {}
+    def _transform(matrix: np.ndarray, x: float, y: float) -> tuple[float, float]:
+        point = np.array([[[x, y]]], dtype=np.float32)
+        result = cv2.perspectiveTransform(point, matrix)
+        return float(result[0, 0, 0]), float(result[0, 0, 1])
+
+    # Per-key lateral (u) ranges, shared by the forward pixel-quadrilateral
+    # build-out below and the reverse lookup closure.
+    u_ranges = {}
     for midi in range(leftmost_midi, rightmost_midi + 1):
         note_name, left_offset, width = _key_geometry(midi)
-        left_px = offset_to_pixel(left_offset)
-        right_px = offset_to_pixel(left_offset + width)
         is_white = (midi % 12) in WHITE_KEY_PITCH_CLASSES
+        u_ranges[note_name] = (left_offset, left_offset + width, is_white, midi)
+
+    keys = {}
+    for note_name, (u0, u1, is_white, midi) in u_ranges.items():
+        v0, v1 = (0.0, TOTAL_DEPTH_W) if is_white else (WHITE_ONLY_ZONE_DEPTH_W, TOTAL_DEPTH_W)
+        corners_px = [
+            _transform(canonical_to_pixel_matrix, u0, v0),
+            _transform(canonical_to_pixel_matrix, u1, v0),
+            _transform(canonical_to_pixel_matrix, u1, v1),
+            _transform(canonical_to_pixel_matrix, u0, v1),
+        ]
+        center_px = (
+            sum(p[0] for p in corners_px) / 4,
+            sum(p[1] for p in corners_px) / 4,
+        )
         keys[note_name] = {
             "midi": midi,
             "is_white": is_white,
-            "left_px": left_px,
-            "right_px": right_px,
-            "center_px": (left_px + right_px) / 2,
+            "corners_px": corners_px,  # [front-left, front-right, back-right, back-left]
+            "center_px": center_px,
         }
 
-    def pixel_to_note(x: float) -> str:
-        # Black keys are drawn "on top" of white keys, so check them first --
-        # an x that falls within a black key's range is the black key, even
-        # though a white key's range also technically covers that x.
+    def pixel_to_note(x: float, y: float) -> str:
+        u, v = _transform(pixel_to_canonical_matrix, x, y)
+        # Physical reachability gate: within the white-only front zone, a
+        # black key literally isn't there to press, regardless of how close
+        # u is to one -- the finger can only be touching the white key.
+        force_white = v < WHITE_ONLY_ZONE_DEPTH_W
+
         for is_white_pass in (False, True):
-            for note_name, bounds in keys.items():
-                if bounds["is_white"] != is_white_pass:
+            if is_white_pass is False and force_white:
+                continue
+            for note_name, (u0, u1, is_white, _midi) in u_ranges.items():
+                if is_white != is_white_pass:
                     continue
-                if bounds["left_px"] <= x < bounds["right_px"]:
+                if u0 <= u < u1:
                     return note_name
-        # Outside the calibrated range -- clamp to the nearest edge key.
-        nearest = min(keys.items(), key=lambda item: abs(item[1]["center_px"] - x))
+
+        # Outside the calibrated lateral range -- clamp to the nearest key
+        # by u, restricted to white keys if depth forces it.
+        candidates = u_ranges.items()
+        if force_white:
+            candidates = [(n, r) for n, r in candidates if r[2]]
+        nearest = min(candidates, key=lambda item: abs((item[1][0] + item[1][1]) / 2 - u))
         return nearest[0]
 
     return {"keys": keys, "pixel_to_note": pixel_to_note}
+
+
+# --- Motion-based key-press confirmation (video/CV layer, Stage 2) ---
+#
+# Uses MediaPipe's Tasks API (mp.solutions.hands is gone entirely as of
+# mediapipe 0.10.35, not just deprecated -- only HandLandmarker exists now).
+# Requires a separately-downloaded model file, same as basic-pitch's
+# checkpoint; see backend/models/hand_landmarker.task.
+
+HAND_LANDMARKER_MODEL_PATH = Path(__file__).parent / "models" / "hand_landmarker.task"
+FINGERTIP_LANDMARK_INDICES = [4, 8, 12, 16, 20]  # thumb, index, middle, ring, pinky tips
+
+# Tunable -- empirically set against test.wav.mp4's known onsets. The 0.015
+# default first tried (a round-number guess) was too strict: real observed
+# peak z-deviations for genuine presses in that clip mostly fell in the
+# 0.004-0.011 range, well under it, so every timestamp came back empty.
+# Lowering the threshold to 0.006 was tested against several window sizes
+# (0.12s, 0.2s, 0.25s) with materially the same ~4/15 accuracy each time --
+# see the validation report for the honest accuracy figure and failure
+# characterization; this is a first-pass value, not a fully solved one.
+KEY_PRESS_WINDOW_SECONDS = 0.2
+KEY_PRESS_DIP_THRESHOLD = 0.006
+
+_hand_landmarker: mp_vision.HandLandmarker | None = None
+
+
+def _get_hand_landmarker() -> mp_vision.HandLandmarker:
+    global _hand_landmarker
+    if _hand_landmarker is None:
+        options = mp_vision.HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(HAND_LANDMARKER_MODEL_PATH)),
+            running_mode=mp_vision.RunningMode.IMAGE,
+            num_hands=2,
+        )
+        _hand_landmarker = mp_vision.HandLandmarker.create_from_options(options)
+    return _hand_landmarker
+
+
+def _extract_frames_in_window(
+    video_path: Path, center_timestamp: float, window_seconds: float, fps: float | None = None
+) -> list[tuple[float, np.ndarray]]:
+    """Extends extract_frame_at_time's seek-by-frame-index approach to pull
+    every frame across a time window instead of a single instant."""
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if fps is None:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            return []
+
+        start_frame = max(0, int((center_timestamp - window_seconds) * fps))
+        end_frame = int((center_timestamp + window_seconds) * fps)
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frames = []
+        frame_index = start_frame
+        while frame_index <= end_frame:
+            success, frame = cap.read()
+            if not success or frame is None:
+                break
+            frames.append((frame_index / fps, frame))
+            frame_index += 1
+        return frames
+    finally:
+        cap.release()
+
+
+def _dip_confidence(z_values: list[float]) -> float:
+    """A real key press is a dip AND a recovery -- baseline from the
+    window's edges, a real deviation in the middle, then back toward
+    baseline. Sign-agnostic: which direction counts as "down" depends on
+    camera angle/hand orientation, so this looks at deviation magnitude,
+    not a hardcoded sign."""
+    n = len(z_values)
+    if n < 3:
+        return 0.0
+
+    edge_count = max(1, n // 4)
+    if n <= 2 * edge_count:
+        return 0.0
+    baseline = (sum(z_values[:edge_count]) + sum(z_values[-edge_count:])) / (2 * edge_count)
+
+    middle = z_values[edge_count:-edge_count]
+    deviations = [abs(v - baseline) for v in middle]
+    peak_deviation = max(deviations)
+    peak_index = deviations.index(peak_deviation)
+
+    if peak_deviation < KEY_PRESS_DIP_THRESHOLD:
+        return 0.0
+
+    # Require recovery after the peak -- otherwise this is drift, not a
+    # press-and-release.
+    after_peak = middle[peak_index:]
+    if len(after_peak) >= 2 and abs(after_peak[-1] - baseline) >= peak_deviation:
+        return 0.0
+
+    return peak_deviation
+
+
+def detect_key_press_at_timestamp(
+    video_path: Path,
+    timestamp: float,
+    calibration: dict,
+    window_seconds: float = KEY_PRESS_WINDOW_SECONDS,
+    fps: float | None = None,
+) -> list[dict]:
+    frames = _extract_frames_in_window(video_path, timestamp, window_seconds, fps=fps)
+    if len(frames) < 3:
+        return []
+
+    frame_height, frame_width = frames[0][1].shape[:2]
+    landmarker = _get_hand_landmarker()
+
+    detections = []
+    for frame_ts, frame in frames:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = landmarker.detect(mp_image)
+        detections.append((frame_ts, result.hand_landmarks))
+
+    anchor_index = min(range(len(detections)), key=lambda i: abs(detections[i][0] - timestamp))
+    _, anchor_hands = detections[anchor_index]
+    if not anchor_hands:
+        return []
+
+    pixel_to_note = calibration["pixel_to_note"]
+
+    results = []
+    for hand in anchor_hands:
+        for finger_idx in FINGERTIP_LANDMARK_INDICES:
+            anchor_lm = hand[finger_idx]
+            anchor_x_px = anchor_lm.x * frame_width
+            anchor_y_px = anchor_lm.y * frame_height
+
+            # MediaPipe's IMAGE mode re-detects hands independently per
+            # frame -- there's no persistent hand/finger identity across
+            # frames the way VIDEO/LIVE_STREAM mode's internal tracker
+            # would provide. Match the same finger index on whichever
+            # detected hand sits closest to the anchor position each frame.
+            trajectory = []
+            for frame_ts, hands in detections:
+                candidates = [h[finger_idx] for h in hands]
+                if not candidates:
+                    continue
+                best = min(
+                    candidates,
+                    key=lambda lm: (lm.x * frame_width - anchor_x_px) ** 2
+                    + (lm.y * frame_height - anchor_y_px) ** 2,
+                )
+                trajectory.append((frame_ts, best.z))
+
+            z_values = [z for _, z in trajectory]
+            confidence = _dip_confidence(z_values)
+            if confidence <= 0:
+                continue
+
+            results.append(
+                {
+                    "note": pixel_to_note(anchor_x_px, anchor_y_px),
+                    "confidence": confidence,
+                    "finger_track": trajectory,
+                }
+            )
+
+    results.sort(key=lambda r: r["confidence"], reverse=True)
+    return results
 
 
 def convert_seconds_to_beats(onset_times: list[float], tempo_bpm: float) -> list[float]:

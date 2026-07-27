@@ -52,3 +52,9 @@ backend/.env
 # ==========================================
 backend/uploads/*
 !backend/uploads/.gitkeep
+
+# ==========================================
+# Downloaded model checkpoints (fetched at setup time, not committed --
+# same reasoning as backend/venv/)
+# ==========================================
+backend/models/

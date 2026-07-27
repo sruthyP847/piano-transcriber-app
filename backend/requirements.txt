@@ -1,4 +1,5 @@
 abjad==3.19
+absl-py==2.5.0
 alabaster==1.0.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
@@ -13,10 +14,14 @@ certifi==2026.6.17
 cffi==2.1.0
 charset-normalizer==3.4.9
 click==8.4.2
+contourpy==1.3.3
 coremltools==9.0
+cycler==0.12.1
 decorator==5.3.1
 docutils==0.22.4
 fastapi==0.139.0
+flatbuffers==25.12.19
+fonttools==4.63.0
 h11==0.16.0
 httptools==0.8.0
 idna==3.18
@@ -25,9 +30,12 @@ ImageIO==2.37.3
 imageio-ffmpeg==0.6.0
 importlib_resources==7.1.0
 joblib==1.5.3
+kiwisolver==1.5.0
 lazy-loader==0.5
 librosa==0.11.0
 llvmlite==0.48.0
+matplotlib==3.11.0
+mediapipe==0.10.35
 mir_eval==0.8.2
 moviepy==2.2.1
 msgpack==1.2.1
@@ -35,6 +43,11 @@ mypy_extensions==1.1.0
 narwhals==2.23.0
 numba==0.66.0
 numpy==2.4.6
+# mediapipe hard-requires opencv-contrib-python; both it and opencv-python
+# coexist here at the same version and work in testing, but installing both
+# is a known OpenCV footgun in general -- if cv2 behaves oddly after a fresh
+# install, this pairing is the first thing to suspect.
+opencv-contrib-python==5.0.0.93
 opencv-python==5.0.0.93
 packaging==26.2
 pathspec==1.1.1
@@ -50,6 +63,8 @@ pycparser==3.0
 pydantic==2.13.4
 pydantic_core==2.46.4
 Pygments==2.20.0
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 python-multipart==0.0.32
 pytokens==0.4.1
@@ -62,7 +77,9 @@ scikit-learn==1.9.0
 scipy==1.17.1
 # setuptools>=81 drops the pkg_resources shim that resampy (a basic-pitch dep) still imports.
 setuptools==80.10.2
+six==1.17.0
 snowballstemmer==3.1.1
+sounddevice==0.5.5
 soundfile==0.14.0
 soxr==1.1.0
 Sphinx==9.0.4
