@@ -38,6 +38,31 @@ function midiToNoteName(midi: number): string {
 }
 const PIANO_NOTE_RANGE = Array.from({ length: 108 - 21 + 1 }, (_, i) => midiToNoteName(21 + i));
 
+// 4-corner keybed calibration (Stage 1.5) -- replaces Stage 1's 2-handle
+// horizontal-only crop, which assumed a purely overhead camera. Fractions
+// are relative to the extracted frame, not raw pixels, so they survive the
+// frame being displayed at any size.
+type CornerKey = "frontLeft" | "frontRight" | "backLeft" | "backRight";
+type Corner = { x: number; y: number };
+type Corners = Record<CornerKey, Corner>;
+
+// Sensible default trapezoid for typical bird's-eye framing: the back edge
+// (further from the camera) reads narrower and higher in frame than the
+// front edge (closer to the camera, where the keys are struck).
+const DEFAULT_CORNERS: Corners = {
+  frontLeft: { x: 0.15, y: 0.85 },
+  frontRight: { x: 0.85, y: 0.85 },
+  backLeft: { x: 0.3, y: 0.15 },
+  backRight: { x: 0.7, y: 0.15 },
+};
+
+const CORNER_LABELS: { key: CornerKey; label: string }[] = [
+  { key: "frontLeft", label: "Front-left" },
+  { key: "frontRight", label: "Front-right" },
+  { key: "backLeft", label: "Back-left" },
+  { key: "backRight", label: "Back-right" },
+];
+
 export default function Home() {
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState(0);
@@ -61,44 +86,30 @@ export default function Home() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewFrameUrl, setPreviewFrameUrl] = useState<string | null>(null);
   const [previewFrameWidth, setPreviewFrameWidth] = useState(0);
+  const [previewFrameHeight, setPreviewFrameHeight] = useState(0);
   const [frameExtractionError, setFrameExtractionError] = useState<string | null>(null);
-  const [leftBoundaryFraction, setLeftBoundaryFraction] = useState(0.1);
-  const [rightBoundaryFraction, setRightBoundaryFraction] = useState(0.9);
+  const [corners, setCorners] = useState<Corners>(DEFAULT_CORNERS);
   const [leftmostNote, setLeftmostNote] = useState("");
   const [rightmostNote, setRightmostNote] = useState("");
-  const [draggingHandle, setDraggingHandle] = useState<"left" | "right" | null>(null);
+  const [draggingCorner, setDraggingCorner] = useState<CornerKey | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cropContainerRef = useRef<HTMLDivElement>(null);
-  const leftFractionRef = useRef(leftBoundaryFraction);
-  const rightFractionRef = useRef(rightBoundaryFraction);
 
+  // Drag handling for the 4 corner handles -- each corner moves
+  // independently in both x and y, no cross-corner constraint needed.
   useEffect(() => {
-    leftFractionRef.current = leftBoundaryFraction;
-  }, [leftBoundaryFraction]);
-  useEffect(() => {
-    rightFractionRef.current = rightBoundaryFraction;
-  }, [rightBoundaryFraction]);
-
-  // Drag handling for the crop handles -- subscribes once per drag session
-  // (reading the other handle's latest position via ref, not state, so the
-  // listeners don't need to be torn down and re-added on every pixel of
-  // movement).
-  useEffect(() => {
-    if (!draggingHandle) return;
+    if (!draggingCorner) return;
 
     const handleMove = (e: MouseEvent) => {
       const container = cropContainerRef.current;
       if (!container) return;
       const rect = container.getBoundingClientRect();
-      const fraction = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
-      if (draggingHandle === "left") {
-        setLeftBoundaryFraction(Math.min(fraction, rightFractionRef.current - 0.02));
-      } else {
-        setRightBoundaryFraction(Math.max(fraction, leftFractionRef.current + 0.02));
-      }
+      const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      const y = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+      setCorners((prev) => ({ ...prev, [draggingCorner]: { x, y } }));
     };
-    const handleUp = () => setDraggingHandle(null);
+    const handleUp = () => setDraggingCorner(null);
 
     // Mouse events (not Pointer Events) for broadest compatibility with both
     // real users and automated input synthesis.
@@ -108,7 +119,7 @@ export default function Home() {
       window.removeEventListener("mousemove", handleMove);
       window.removeEventListener("mouseup", handleUp);
     };
-  }, [draggingHandle]);
+  }, [draggingCorner]);
 
   const resetState = () => {
     setStatus("idle");
@@ -126,9 +137,9 @@ export default function Home() {
     setSelectedFile(null);
     setPreviewFrameUrl(null);
     setPreviewFrameWidth(0);
+    setPreviewFrameHeight(0);
     setFrameExtractionError(null);
-    setLeftBoundaryFraction(0.1);
-    setRightBoundaryFraction(0.9);
+    setCorners(DEFAULT_CORNERS);
     setLeftmostNote("");
     setRightmostNote("");
   };
@@ -166,6 +177,7 @@ export default function Home() {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       setPreviewFrameUrl(canvas.toDataURL("image/png"));
       setPreviewFrameWidth(canvas.width);
+      setPreviewFrameHeight(canvas.height);
       cleanup();
     });
 
@@ -186,8 +198,7 @@ export default function Home() {
       setErrorMessage(null);
       setSelectedFile(file);
       setFileName(file.name);
-      setLeftBoundaryFraction(0.1);
-      setRightBoundaryFraction(0.9);
+      setCorners(DEFAULT_CORNERS);
       setLeftmostNote("");
       setRightmostNote("");
       extractPreviewFrame(file);
@@ -200,11 +211,11 @@ export default function Home() {
     setFileName(null);
     setPreviewFrameUrl(null);
     setPreviewFrameWidth(0);
+    setPreviewFrameHeight(0);
     setFrameExtractionError(null);
     setLeftmostNote("");
     setRightmostNote("");
-    setLeftBoundaryFraction(0.1);
-    setRightBoundaryFraction(0.9);
+    setCorners(DEFAULT_CORNERS);
   };
 
   const uploadFile = useCallback(async (file: File) => {
@@ -320,8 +331,15 @@ export default function Home() {
   );
 
   const isBusy = status === "uploading" || status === "processing";
-  const keyboardPixelLeft = previewFrameWidth ? leftBoundaryFraction * previewFrameWidth : null;
-  const keyboardPixelRight = previewFrameWidth ? rightBoundaryFraction * previewFrameWidth : null;
+  const cornerPixels: Record<CornerKey, Corner> | null =
+    previewFrameWidth && previewFrameHeight
+      ? {
+          frontLeft: { x: corners.frontLeft.x * previewFrameWidth, y: corners.frontLeft.y * previewFrameHeight },
+          frontRight: { x: corners.frontRight.x * previewFrameWidth, y: corners.frontRight.y * previewFrameHeight },
+          backLeft: { x: corners.backLeft.x * previewFrameWidth, y: corners.backLeft.y * previewFrameHeight },
+          backRight: { x: corners.backRight.x * previewFrameWidth, y: corners.backRight.y * previewFrameHeight },
+        }
+      : null;
   const calibrationComplete = Boolean(
     selectedFile &&
       previewFrameUrl &&
@@ -722,8 +740,8 @@ export default function Home() {
               </button>
             </div>
             <p className="mt-1 text-xs text-gray-500">
-              Drag the two handles to the keyboard&apos;s left and right edges, then tell us which
-              notes are visible there.
+              Drag the four corner handles onto the keybed&apos;s actual front-left, front-right,
+              back-left, and back-right corners, then tell us which notes are visible there.
             </p>
 
             {frameExtractionError && (
@@ -742,30 +760,31 @@ export default function Home() {
                   className="block h-auto w-full"
                   draggable={false}
                 />
-                <div
-                  className="absolute inset-y-0 left-0 bg-black/40"
-                  style={{ width: `${leftBoundaryFraction * 100}%` }}
-                />
-                <div
-                  className="absolute inset-y-0 right-0 bg-black/40"
-                  style={{ width: `${(1 - rightBoundaryFraction) * 100}%` }}
-                />
-                <div
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    setDraggingHandle("left");
-                  }}
-                  className="absolute inset-y-0 -ml-1.5 w-3 cursor-ew-resize bg-indigo-500"
-                  style={{ left: `${leftBoundaryFraction * 100}%` }}
-                />
-                <div
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    setDraggingHandle("right");
-                  }}
-                  className="absolute inset-y-0 -ml-1.5 w-3 cursor-ew-resize bg-indigo-500"
-                  style={{ left: `${rightBoundaryFraction * 100}%` }}
-                />
+                <svg
+                  className="pointer-events-none absolute inset-0 h-full w-full"
+                  preserveAspectRatio="none"
+                  viewBox="0 0 100 100"
+                >
+                  <polygon
+                    points={`${corners.frontLeft.x * 100},${corners.frontLeft.y * 100} ${corners.frontRight.x * 100},${corners.frontRight.y * 100} ${corners.backRight.x * 100},${corners.backRight.y * 100} ${corners.backLeft.x * 100},${corners.backLeft.y * 100}`}
+                    fill="rgba(99,102,241,0.15)"
+                    stroke="rgb(99,102,241)"
+                    strokeWidth="0.5"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                </svg>
+                {CORNER_LABELS.map(({ key, label }) => (
+                  <div
+                    key={key}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      setDraggingCorner(key);
+                    }}
+                    title={label}
+                    className="absolute -ml-2 -mt-2 h-4 w-4 cursor-grab rounded-full border-2 border-white bg-indigo-500 shadow active:cursor-grabbing"
+                    style={{ left: `${corners[key].x * 100}%`, top: `${corners[key].y * 100}%` }}
+                  />
+                ))}
               </div>
             )}
 
@@ -774,10 +793,15 @@ export default function Home() {
             )}
 
             <p className="mt-2 text-xs text-gray-500">
-              Left edge:{" "}
-              {keyboardPixelLeft !== null ? `${keyboardPixelLeft.toFixed(1)}px` : "—"} · Right
-              edge: {keyboardPixelRight !== null ? `${keyboardPixelRight.toFixed(1)}px` : "—"}
-              {previewFrameWidth ? ` (of ${previewFrameWidth}px wide frame)` : ""}
+              Front-left:{" "}
+              {cornerPixels ? `(${cornerPixels.frontLeft.x.toFixed(1)}, ${cornerPixels.frontLeft.y.toFixed(1)})` : "—"}
+              {" · "}Front-right:{" "}
+              {cornerPixels ? `(${cornerPixels.frontRight.x.toFixed(1)}, ${cornerPixels.frontRight.y.toFixed(1)})` : "—"}
+              {" · "}Back-left:{" "}
+              {cornerPixels ? `(${cornerPixels.backLeft.x.toFixed(1)}, ${cornerPixels.backLeft.y.toFixed(1)})` : "—"}
+              {" · "}Back-right:{" "}
+              {cornerPixels ? `(${cornerPixels.backRight.x.toFixed(1)}, ${cornerPixels.backRight.y.toFixed(1)})` : "—"}
+              {previewFrameWidth ? ` (frame ${previewFrameWidth}x${previewFrameHeight}px)` : ""}
             </p>
 
             <div className="mt-4 grid grid-cols-2 gap-3">
