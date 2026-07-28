@@ -519,6 +519,11 @@ def build_keyboard_calibration(
             "is_white": is_white,
             "corners_px": corners_px,  # [front-left, front-right, back-right, back-left]
             "center_px": center_px,
+            # Canonical lateral extent/centre. Kept alongside the pixel
+            # geometry so proximity checks can work in real millimetres
+            # instead of pixels, which vary with perspective across the frame.
+            "u_range": (u0, u1),
+            "u_center": (u0 + u1) / 2,
         }
 
     def pixel_to_note(x: float, y: float) -> str:
@@ -545,7 +550,21 @@ def build_keyboard_calibration(
         nearest = min(candidates, key=lambda item: abs((item[1][0] + item[1][1]) / 2 - u))
         return nearest[0]
 
-    return {"keys": keys, "pixel_to_note": pixel_to_note}
+    def pixel_to_canonical(x: float, y: float) -> tuple[float, float]:
+        """Raw (u, v) in white-key-width units -- unlike pixel_to_note this
+        doesn't snap to a key, so callers can measure real distances."""
+        return _transform(pixel_to_canonical_matrix, x, y)
+
+    return {
+        "keys": keys,
+        # Indexed by MIDI as well as name: librosa.midi_to_note() emits
+        # unicode sharps ("A♯4") while these key names are ASCII ("A#4"), so
+        # name lookups from pipeline data would silently miss every sharp.
+        "keys_by_midi": {info["midi"]: info for info in keys.values()},
+        "pixel_to_note": pixel_to_note,
+        "pixel_to_canonical": pixel_to_canonical,
+        "u_bounds": (u_left, u_right),
+    }
 
 
 # --- Motion-based key-press confirmation (video/CV layer, Stage 2) ---
@@ -712,6 +731,65 @@ def detect_key_press_at_timestamp(
 
     results.sort(key=lambda r: r["confidence"], reverse=True)
     return results
+
+
+# --- Lateral proximity measurement (video/CV layer, Stage 2.5) ---
+#
+# Stages 2 and 1.5 between them established that MediaPipe's z signal cannot
+# reliably resolve a ~10mm key press (accuracy sat at 3-4/15 whether or not
+# the calibration geometry was perspective-correct). So this drops motion and
+# z entirely and uses only what MediaPipe is genuinely reliable at: 2D lateral
+# hand position. One frame, no window, no trajectory, no dip detection.
+
+ALL_HAND_LANDMARK_INDICES = list(range(21))
+
+
+def detect_hand_canonical_positions(
+    video_path: Path,
+    timestamp: float,
+    calibration: dict,
+    landmark_indices: list[int] | None = None,
+) -> dict:
+    """Project hand landmarks visible at `timestamp` into canonical keyboard
+    space, using the single frame nearest that instant."""
+    if landmark_indices is None:
+        landmark_indices = FINGERTIP_LANDMARK_INDICES
+
+    frame = extract_frame_at_time(video_path, timestamp)
+    if frame is None:
+        return {"hands_detected": 0, "points": [], "frame_read": False}
+
+    frame_height, frame_width = frame.shape[:2]
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+    result = _get_hand_landmarker().detect(mp_image)
+
+    pixel_to_canonical = calibration["pixel_to_canonical"]
+    points = []
+    for hand_index, hand in enumerate(result.hand_landmarks):
+        for index in landmark_indices:
+            landmark = hand[index]
+            u, v = pixel_to_canonical(landmark.x * frame_width, landmark.y * frame_height)
+            points.append({"hand": hand_index, "landmark": index, "u": u, "v": v})
+
+    return {
+        "hands_detected": len(result.hand_landmarks),
+        "points": points,
+        "frame_read": True,
+    }
+
+
+def lateral_distance_to_nearest_landmark_mm(
+    calibration: dict, midi: int, points: list[dict]
+) -> float | None:
+    """Lateral (u-axis) distance in mm from a note's key centre to the nearest
+    projected landmark. Returns None when the note falls outside the calibrated
+    range -- that's unverifiable, which is a different thing from "far away"
+    and must not be collapsed into a large distance."""
+    key = calibration["keys_by_midi"].get(midi)
+    if key is None or not points:
+        return None
+    return min(abs(point["u"] - key["u_center"]) * WHITE_KEY_WIDTH_MM for point in points)
 
 
 def convert_seconds_to_beats(onset_times: list[float], tempo_bpm: float) -> list[float]:
