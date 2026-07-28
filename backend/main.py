@@ -907,7 +907,21 @@ def detect_notes_basic_pitch(audio_path: Path) -> list[dict]:
 
 
 DEDUP_GAP_SECONDS = 0.05  # max gap between offset and next onset, same pitch, to treat as one fragmented note
-DEDUP_MAX_SPAN_SECONDS = 2.0  # cap on total merged-note duration; the longest genuine single-attack note observed in testing is ~1.65s, so a chain exceeding this is almost certainly separate re-attacks, not one fragmented note
+# Cap on total merged-note duration, expressed in BEATS because it describes a
+# musical note length, not a physical constant. It was previously 2.0 SECONDS,
+# justified by "the longest genuine note observed in testing is ~1.65s" -- but
+# that observation is tempo-dependent, so encoding it as an absolute duration
+# was wrong: a whole note at 60 BPM lasts 4s and would have been split.
+# 4.0 beats = a whole note in 4/4, which is the longest value the notation
+# vocabulary (NOTATION_STANDARD_VALUES) can spell, so a fragment chain longer
+# than this is almost certainly separate re-attacks rather than one note.
+# Empirically chosen, not guessed: sweeping the cap shows the reference clips
+# keep byte-identical output only for 1.57-2.06s on chords-notes-mix.mp4
+# (= 3.22-4.22 beats at its 123 BPM), and for any value on test.wav.mp4
+# (nothing there merges >1 fragment, so the cap never binds). 4.0 beats is the
+# only musically meaningful value inside that intersection -- 3.0 beats would
+# be 1.46s at 123 BPM and would split a real 1.569s two-fragment merge.
+DEDUP_MAX_SPAN_BEATS = 4.0
 GROUPING_WINDOW_SECONDS = 0.15  # same value as the old onset grouping
 SOLID_THRESHOLD_SECONDS = 0.03  # same as before, for style classification
 RELATIVE_CONFIDENCE_FRACTION = 0.6  # a note must reach this fraction of its event's strongest note to survive
@@ -917,8 +931,13 @@ ABSOLUTE_CONFIDENCE_FLOOR = 0.35  # hard floor below which nothing survives rega
 def deduplicate_notes(
     notes: list[dict],
     gap_threshold: float = DEDUP_GAP_SECONDS,
-    max_span: float = DEDUP_MAX_SPAN_SECONDS,
+    *,
+    max_span_seconds: float,
 ) -> list[dict]:
+    """`max_span_seconds` is keyword-only and deliberately has NO default: it
+    must be derived from the piece's tempo by the caller (see
+    DEDUP_MAX_SPAN_BEATS). A default here would be a tempo-blind constant,
+    which is exactly the bug this signature exists to prevent."""
     if not notes:
         return []
 
@@ -939,7 +958,7 @@ def deduplicate_notes(
         for note in pitch_notes[1:]:
             gap = note["onset"] - current["offset"]
             prospective_span = note["offset"] - current["onset"]
-            if gap <= gap_threshold and prospective_span <= max_span:
+            if gap <= gap_threshold and prospective_span <= max_span_seconds:
                 # Chain absorption: current keeps extending as long as the next
                 # fragment matches, so a note split into 3+ pieces still merges
                 # into a single entry rather than just pairwise. The span cap
@@ -1122,7 +1141,11 @@ def analyze_audio(
         tempo_source = "auto"
 
     notes = detect_notes_basic_pitch(audio_path)
-    deduped = deduplicate_notes(notes)
+    # Convert the beat-relative dedup cap to seconds here, where the piece's
+    # tempo (user-supplied or auto-detected above) is known -- deduplicate_notes
+    # itself works in raw seconds because that's what onsets/offsets are in.
+    dedup_max_span_seconds = DEDUP_MAX_SPAN_BEATS * 60.0 / tempo_bpm
+    deduped = deduplicate_notes(notes, max_span_seconds=dedup_max_span_seconds)
     events = group_notes_into_events(deduped)
     filtered_events = filter_event_notes(events)
     filtered_events = suppress_decay_tail_notes(filtered_events)
