@@ -26,6 +26,12 @@ type EventData = {
 
 // Present in the response only when calibration was supplied. It is reported
 // back purely so the mapping can be verified -- it does not affect detection.
+type KeySignatureInfo = {
+  tonic: string;
+  mode: string;
+  accidentals: number;
+};
+
 type CalibrationSummary = {
   leftmost_note: string;
   rightmost_note: string;
@@ -41,6 +47,37 @@ const API_BASE = "http://localhost:8000";
 type TimeSignatureMode = "auto" | "specify";
 const SIMPLE_METERS = ["4/4", "3/4", "2/4"];
 const COMPOUND_METERS = ["6/8", "9/8", "12/8"];
+
+// All 30 standard keys, ordered around the circle of fifths (naturals first,
+// then sharps outward, then flats outward) so the dropdown reads the way a
+// musician expects rather than alphabetically. `value` is the wire format the
+// backend parses; `label` also states the accidental count, because "Gb major"
+// alone doesn't tell you it's six flats.
+// Note the minor list runs A E B F# C# G# D# A# on the sharp side -- A# minor
+// (7 sharps) is the one that's easy to leave out.
+type KeyOption = { value: string; label: string };
+function keyLabel(tonic: string, mode: string, n: number): string {
+  const count = Math.abs(n);
+  const kind = n > 0 ? "sharp" : "flat";
+  const detail = count === 0 ? "no accidentals" : `${count} ${kind}${count > 1 ? "s" : ""}`;
+  return `${tonic} ${mode} (${detail})`;
+}
+const KEY_SIGNATURE_OPTIONS: KeyOption[] = (
+  [
+    ["C", "major", 0], ["G", "major", 1], ["D", "major", 2], ["A", "major", 3],
+    ["E", "major", 4], ["B", "major", 5], ["F#", "major", 6], ["C#", "major", 7],
+    ["F", "major", -1], ["Bb", "major", -2], ["Eb", "major", -3], ["Ab", "major", -4],
+    ["Db", "major", -5], ["Gb", "major", -6], ["Cb", "major", -7],
+    ["A", "minor", 0], ["E", "minor", 1], ["B", "minor", 2], ["F#", "minor", 3],
+    ["C#", "minor", 4], ["G#", "minor", 5], ["D#", "minor", 6], ["A#", "minor", 7],
+    ["D", "minor", -1], ["G", "minor", -2], ["C", "minor", -3], ["F", "minor", -4],
+    ["Bb", "minor", -5], ["Eb", "minor", -6], ["Ab", "minor", -7],
+  ] as [string, string, number][]
+).map(([tonic, mode, n]) => ({
+  value: `${tonic} ${mode}`,
+  label: keyLabel(tonic, mode, n),
+}));
+const DEFAULT_KEY_SIGNATURE = "C major";
 
 // Standard 88-key range, A0..C8.
 const NOTE_LETTERS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -114,6 +151,7 @@ export default function Home() {
   const [simpleMeter, setSimpleMeter] = useState("");
   const [compoundMeter, setCompoundMeter] = useState("");
   const [tempoBpmInput, setTempoBpmInput] = useState("");
+  const [keySignature, setKeySignature] = useState(DEFAULT_KEY_SIGNATURE);
   const [hasPickup, setHasPickup] = useState(false);
   const [pickupBeatsInput, setPickupBeatsInput] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -126,6 +164,7 @@ export default function Home() {
   const [rightmostNote, setRightmostNote] = useState("");
   const [draggingCorner, setDraggingCorner] = useState<CornerKey | null>(null);
   const [calibrationSummary, setCalibrationSummary] = useState<CalibrationSummary | null>(null);
+  const [resolvedKey, setResolvedKey] = useState<KeySignatureInfo | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cropContainerRef = useRef<HTMLDivElement>(null);
@@ -302,6 +341,10 @@ export default function Home() {
         formData.append("tempo_bpm", String(parsedTempo));
       }
 
+      // Always sent, since the dropdown always holds a valid key. The backend
+      // treats an absent field as C major anyway, so older clients still work.
+      formData.append("key_signature", keySignature);
+
       // Pickup-measure UI stays interactive, but the backend doesn't support
       // it yet -- has_pickup/pickup_beats are intentionally not sent.
 
@@ -366,6 +409,7 @@ export default function Home() {
         setRawNotes(Array.isArray(data.raw_notes) ? data.raw_notes : []);
         setEvents(Array.isArray(data.events) ? data.events : []);
         setCalibrationSummary(data.calibration ?? null);
+        setResolvedKey(data.key_signature ?? null);
       }, 600);
     } catch (err) {
       if (progressIntervalRef.current) {
@@ -381,6 +425,7 @@ export default function Home() {
     simpleMeter,
     compoundMeter,
     tempoBpmInput,
+    keySignature,
     corners,
     previewFrameWidth,
     previewFrameHeight,
@@ -472,6 +517,24 @@ export default function Home() {
                   <dd className="text-xs text-gray-500">kHz</dd>
                 </div>
               </dl>
+
+              {resolvedKey && (
+                <p className="mt-3 text-center text-sm text-gray-400">
+                  Key signature{" "}
+                  <span className="font-semibold text-indigo-400">
+                    {resolvedKey.tonic} {resolvedKey.mode}
+                  </span>{" "}
+                  <span className="text-xs text-gray-500">
+                    (
+                    {resolvedKey.accidentals === 0
+                      ? "no accidentals"
+                      : `${Math.abs(resolvedKey.accidentals)} ${
+                          resolvedKey.accidentals > 0 ? "sharp" : "flat"
+                        }${Math.abs(resolvedKey.accidentals) > 1 ? "s" : ""}`}
+                    )
+                  </span>
+                </p>
+              )}
 
               <div className="mt-6 flex flex-col gap-3">
                 <a
@@ -700,6 +763,27 @@ export default function Home() {
                   </div>
                 </div>
               )}
+            </div>
+
+            <div className="mt-4">
+              <label className="block text-xs font-medium uppercase tracking-wide text-gray-500">
+                Key signature
+              </label>
+              <select
+                value={keySignature}
+                onChange={(e) => setKeySignature(e.target.value)}
+                className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900"
+              >
+                {KEY_SIGNATURE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-xs text-gray-500">
+                We don&apos;t detect the key — pick it and we&apos;ll spell the notes to
+                match (E flat rather than D sharp in flat keys).
+              </p>
             </div>
 
             <div className="mt-4">

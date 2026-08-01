@@ -254,11 +254,165 @@ def note_name_to_lilypond_pitch(note_name: str) -> str:
     return pitch
 
 
+# --- Key signature model and key-aware enharmonic spelling ---
+#
+# Two problems that HAD to be fixed together: no key signature was attached to
+# the score (so LilyPond defaulted to C major and printed every accidental
+# inline), and librosa.midi_to_note() always returns SHARP spellings. Attaching
+# a flat key signature while still emitting sharp note names would have been
+# worse than doing nothing -- the score would show inline sharps contradicting
+# a flat signature.
+#
+# Accidental count per key, positive = sharps, negative = flats. All 30 keys
+# (15 major + 15 minor) enumerated explicitly rather than derived, so the table
+# can be checked against the circle of fifths by eye. Minor keys carry their
+# relative major's signature (A minor = C major = 0, and so on up/down the
+# circle) -- note A# minor (7 sharps) exists and is easy to omit by accident.
+KEY_SIGNATURE_ACCIDENTALS: dict[tuple[str, str], int] = {
+    ("C", "major"): 0, ("G", "major"): 1, ("D", "major"): 2, ("A", "major"): 3,
+    ("E", "major"): 4, ("B", "major"): 5, ("F#", "major"): 6, ("C#", "major"): 7,
+    ("F", "major"): -1, ("Bb", "major"): -2, ("Eb", "major"): -3, ("Ab", "major"): -4,
+    ("Db", "major"): -5, ("Gb", "major"): -6, ("Cb", "major"): -7,
+    ("A", "minor"): 0, ("E", "minor"): 1, ("B", "minor"): 2, ("F#", "minor"): 3,
+    ("C#", "minor"): 4, ("G#", "minor"): 5, ("D#", "minor"): 6, ("A#", "minor"): 7,
+    ("D", "minor"): -1, ("G", "minor"): -2, ("C", "minor"): -3, ("F", "minor"): -4,
+    ("Bb", "minor"): -5, ("Eb", "minor"): -6, ("Ab", "minor"): -7,
+}
+
+# Order in which accidentals are added around the circle of fifths.
+SHARP_ORDER = ["F", "C", "G", "D", "A", "E", "B"]
+FLAT_ORDER = ["B", "E", "A", "D", "G", "C", "F"]
+
+DEFAULT_KEY_SIGNATURE = ("C", "major")
+
+
+def parse_key_signature(text: str | None) -> tuple[str, str]:
+    """Parse "d major" / "Eb minor" / "F# Major" into a canonical (tonic, mode).
+
+    Falls back to C major for None/blank so callers that never send the field
+    behave exactly as before. Raises ValueError on a genuinely bad value so the
+    endpoint can turn it into a 400 rather than silently transposing the score.
+    """
+    if text is None or not text.strip():
+        return DEFAULT_KEY_SIGNATURE
+
+    parts = text.strip().split()
+    if len(parts) != 2:
+        raise ValueError(f"key_signature {text!r} must look like '<tonic> <major|minor>'")
+    raw_tonic, raw_mode = parts
+
+    mode = raw_mode.lower()
+    if mode not in ("major", "minor"):
+        raise ValueError(f"key_signature mode {raw_mode!r} must be 'major' or 'minor'")
+
+    # Normalise "eb"/"EB"/"E♭" -> "Eb", "f#"/"F♯" -> "F#".
+    tonic = raw_tonic[0].upper()
+    for suffix in raw_tonic[1:]:
+        if suffix in _SHARP_SYMBOLS:
+            tonic += "#"
+        elif suffix in _FLAT_SYMBOLS:
+            tonic += "b"
+        else:
+            raise ValueError(f"key_signature tonic {raw_tonic!r} is not a valid note name")
+
+    if (tonic, mode) not in KEY_SIGNATURE_ACCIDENTALS:
+        raise ValueError(
+            f"key_signature {tonic} {mode} is not one of the 30 standard keys "
+            "(a key like D# major exists only as an enharmonic respelling)"
+        )
+    return tonic, mode
+
+
+def key_letter_accidentals(accidental_count: int) -> dict[str, int]:
+    """Per-letter accidental implied by a key signature, e.g. 2 sharps ->
+    {F: +1, C: +1, rest 0}."""
+    letters = {letter: 0 for letter in NOTE_LETTER_SEMITONES}
+    if accidental_count > 0:
+        for letter in SHARP_ORDER[:accidental_count]:
+            letters[letter] = 1
+    elif accidental_count < 0:
+        for letter in FLAT_ORDER[:-accidental_count]:
+            letters[letter] = -1
+    return letters
+
+
+def spell_midi_in_key(midi: int, letter_accidentals: dict[str, int], prefer_flats: bool) -> str:
+    """MIDI number -> note name spelled for the key, e.g. 63 -> "Eb4" in Eb
+    major (not "D#4", which is what librosa.midi_to_note would give).
+
+    Three rules, applied in this order:
+
+    1. Diatonic -- take the spelling the key signature dictates (in Eb major
+       MIDI 63 is Eb, not D#).
+    2. Chromatic but a NATURAL letter exists at that pitch class -- spell it
+       natural, and let the engraver add the natural sign. This rule is not
+       optional: without it, C natural in D major comes out as B#, and B
+       natural in F major as Cb, because rule 3 would blindly alter a
+       neighbouring letter. Those are the notes an accidental-heavy passage
+       hits most often, so getting this wrong is very visible.
+    3. Otherwise (one of the five genuinely-black-key pitch classes, not in
+       the key) -- follow the key's accidental DIRECTION: sharp keys spell it
+       as a sharp, flat keys as a flat.
+
+    Rule 3 is a HEURISTIC, and its limits are worth being explicit about: the
+    musically-correct spelling of a chromatic note often depends on harmonic
+    function we do not have. A raised fourth leading to the dominant genuinely
+    wants a sharp even in a flat key (F# in C minor), and a borrowed flat sixth
+    wants a flat even in a sharp key. Getting those right needs chord/function
+    analysis (the unbuilt music-theory engine), so this picks the direction
+    that is right most often within a key rather than pretending to know the
+    harmony.
+    """
+    pitch_class = midi % 12
+
+    # 1. Diatonic: exactly one letter in the key produces this pitch class.
+    for letter, accidental in letter_accidentals.items():
+        if (NOTE_LETTER_SEMITONES[letter] + accidental) % 12 == pitch_class:
+            return _format_note_name(letter, accidental, midi)
+
+    # 2. A natural letter sits on this pitch class -- prefer it over altering
+    #    a neighbour, even if the key alters that letter.
+    for letter, semitones in NOTE_LETTER_SEMITONES.items():
+        if semitones % 12 == pitch_class:
+            return _format_note_name(letter, 0, midi)
+
+    # 3. A black-key pitch class outside the key: follow the key's direction.
+    step = -1 if prefer_flats else 1
+    for letter, semitones in NOTE_LETTER_SEMITONES.items():
+        if (semitones + step) % 12 == pitch_class:
+            return _format_note_name(letter, step, midi)
+
+    raise ValueError(f"could not spell MIDI {midi}")
+
+
+def _format_note_name(letter: str, accidental: int, midi: int) -> str:
+    """Assemble "Eb4"-style names. The octave is derived from the SPELLING, not
+    from midi // 12, so enharmonics that cross an octave boundary stay correct:
+    Cb4 and B3 are the same pitch (MIDI 59) but belong to different octaves."""
+    octave = (midi - NOTE_LETTER_SEMITONES[letter] - accidental) // 12 - 1
+    suffix = "#" if accidental == 1 else "b" if accidental == -1 else ""
+    return f"{letter}{suffix}{octave}"
+
+
+def tonic_to_lilypond(tonic: str) -> str:
+    """"Eb" -> "ef", "F#" -> "fs" -- abjad's English naming (verified against
+    the installed abjad, which rejects Dutch "cis"/"ces" outright)."""
+    pitch = tonic[0].lower()
+    if len(tonic) > 1:
+        if tonic[1] in _SHARP_SYMBOLS:
+            pitch += "s"
+        elif tonic[1] in _FLAT_SYMBOLS:
+            pitch += "f"
+    return pitch
+
+
 def _build_staff_input(
     events: list[dict],
     is_treble: bool,
     total_sixteenths: int,
     bar_length_beats: float = NOTATION_BEATS_PER_BAR,
+    letter_accidentals: dict[str, int] | None = None,
+    prefer_flats: bool = False,
 ) -> str:
     tokens: list[str] = []
     position = 0
@@ -283,8 +437,18 @@ def _build_staff_input(
             # event already filled to -- nothing sensible to notate, skip it.
             continue
 
+        # Spelling is key-aware, but the treble/bass split is unchanged: it is
+        # still purely pitch-based on the same MIDI value as before. Respelling
+        # can't move a note between staves -- Cb4 and B3 are the same MIDI
+        # number, so they land on the same staff either way.
         pitches = [
-            note_name_to_lilypond_pitch(note["note"])
+            note_name_to_lilypond_pitch(
+                spell_midi_in_key(
+                    note_name_to_midi(note["note"]), letter_accidentals, prefer_flats
+                )
+                if letter_accidentals is not None
+                else note["note"]
+            )
             for note in event["notes"]
             if (note_name_to_midi(note["note"]) >= 60) == is_treble
         ]
@@ -314,7 +478,17 @@ def generate_notation_pdf(
     events: list[dict],
     output_path: Path,
     time_signature: tuple[int, int] = (4, 4),
+    key_signature: tuple[str, str] = DEFAULT_KEY_SIGNATURE,
 ) -> None:
+    tonic, mode = key_signature
+    accidental_count = KEY_SIGNATURE_ACCIDENTALS[(tonic, mode)]
+    letter_accidentals = key_letter_accidentals(accidental_count)
+    # Flat keys spell chromatic notes as flats. C major / A minor have no
+    # accidentals and so no direction of their own -- they keep sharps, which
+    # is what librosa.midi_to_note produced before this existed, so their
+    # output is unchanged.
+    prefer_flats = accidental_count < 0
+
     bar_length_beats = time_signature_bar_length_beats(*time_signature)
     bar_size_sixteenths = round(bar_length_beats * NOTATION_SIXTEENTHS_PER_BEAT)
 
@@ -336,20 +510,34 @@ def generate_notation_pdf(
         is_treble=True,
         total_sixteenths=total_sixteenths,
         bar_length_beats=bar_length_beats,
+        letter_accidentals=letter_accidentals,
+        prefer_flats=prefer_flats,
     )
     bass_input = _build_staff_input(
         events,
         is_treble=False,
         total_sixteenths=total_sixteenths,
         bar_length_beats=bar_length_beats,
+        letter_accidentals=letter_accidentals,
+        prefer_flats=prefer_flats,
     )
 
     treble_staff = abjad.Staff(treble_input, name="Treble")
     bass_staff = abjad.Staff(bass_input, name="Bass")
 
+    # Attached to BOTH staves: on a PianoStaff, LilyPond does not propagate a
+    # key signature from one staff to the other, so a single attach would
+    # engrave the accidentals on the treble stave only.
+    abjad_key = abjad.KeySignature(abjad.NamedPitchClass(tonic_to_lilypond(tonic)), abjad.Mode(mode))
     abjad.attach(abjad.Clef("treble"), abjad.select.leaves(treble_staff)[0])
+    abjad.attach(abjad_key, abjad.select.leaves(treble_staff)[0])
     abjad.attach(abjad.TimeSignature(time_signature), abjad.select.leaves(treble_staff)[0])
     abjad.attach(abjad.Clef("bass"), abjad.select.leaves(bass_staff)[0])
+    # A fresh instance: abjad forbids attaching one indicator to two leaves.
+    abjad.attach(
+        abjad.KeySignature(abjad.NamedPitchClass(tonic_to_lilypond(tonic)), abjad.Mode(mode)),
+        abjad.select.leaves(bass_staff)[0],
+    )
     abjad.attach(abjad.TimeSignature(time_signature), abjad.select.leaves(bass_staff)[0])
 
     piano_staff_group = abjad.StaffGroup(
@@ -1388,6 +1576,9 @@ async def transcribe(
     file: UploadFile,
     time_signature: str | None = Form(None),
     tempo_bpm: float | None = Form(None),
+    # Optional; absent means C major, which is what the score defaulted to
+    # before key signatures existed.
+    key_signature: str | None = Form(None),
     # Optional, and must stay optional: every caller without calibration data
     # (including the pipeline's own regression fixtures) has to keep working
     # byte-identically. When absent, nothing below touches the analysis at all.
@@ -1398,6 +1589,12 @@ async def transcribe(
             status_code=400,
             detail=f"Unsupported file type: {file.content_type}. Please upload a video file.",
         )
+
+    # Parsed up front so a bad key fails before any file is written or analysed.
+    try:
+        resolved_key = parse_key_signature(key_signature)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     file_id = uuid.uuid4()
     extension = Path(file.filename).suffix
@@ -1476,6 +1673,7 @@ async def transcribe(
         audio_analysis["events"],
         UPLOAD_DIR / pdf_filename,
         time_signature=parse_time_signature(audio_analysis["time_signature"]),
+        key_signature=resolved_key,
     )
     generate_placeholder_musicxml(UPLOAD_DIR / musicxml_filename)
 
@@ -1490,6 +1688,11 @@ async def transcribe(
         "pdf_url": f"{BASE_URL}/api/uploads/{pdf_filename}",
         "musicxml_url": f"{BASE_URL}/api/uploads/{musicxml_filename}",
         **audio_analysis,
+        "key_signature": {
+            "tonic": resolved_key[0],
+            "mode": resolved_key[1],
+            "accidentals": KEY_SIGNATURE_ACCIDENTALS[resolved_key],
+        },
     }
     # Added only when calibration was supplied, so the no-calibration response
     # keeps exactly the shape it has today rather than gaining a null field.
