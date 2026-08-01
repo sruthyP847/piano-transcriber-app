@@ -24,6 +24,17 @@ type EventData = {
   dropped_notes: EventNote[];
 };
 
+// Present in the response only when calibration was supplied. It is reported
+// back purely so the mapping can be verified -- it does not affect detection.
+type CalibrationSummary = {
+  leftmost_note: string;
+  rightmost_note: string;
+  frame_width: number | null;
+  frame_height: number | null;
+  key_count: number;
+  white_key_count: number;
+};
+
 const ACCEPTED_TYPES = ["video/mp4", "video/quicktime", "video/x-m4v"];
 const API_BASE = "http://localhost:8000";
 
@@ -63,6 +74,28 @@ const CORNER_LABELS: { key: CornerKey; label: string }[] = [
   { key: "backRight", label: "Back-right" },
 ];
 
+// Handles used to be clamped to [0,1], i.e. to the frame itself -- which made
+// a correct calibration literally unexpressible for close-up shots, where the
+// keybed runs off the edge. Both reference clips hit this: test.wav.mp4's
+// front-left corner is at x=-17.6px on a 640px frame, and
+// chords-notes-mix.mp4's front-right is at x=259.5px on a 240px frame. So the
+// draggable stage extends a margin past every edge and the preview is
+// letterboxed inside it. Bounded rather than unbounded so a stray drag can't
+// fling a corner somewhere that yields a wildly unstable homography.
+const HANDLE_MARGIN = 0.25; // in normalized frame units, per side
+const HANDLE_SPAN = 1 + 2 * HANDLE_MARGIN;
+
+// normalized frame coordinate -> % position within the padded stage
+const toStagePercent = (frameCoord: number) =>
+  ((frameCoord + HANDLE_MARGIN) / HANDLE_SPAN) * 100;
+
+// fraction across the padded stage -> normalized frame coordinate
+const toFrameCoord = (stageFraction: number) =>
+  Math.min(
+    1 + HANDLE_MARGIN,
+    Math.max(-HANDLE_MARGIN, stageFraction * HANDLE_SPAN - HANDLE_MARGIN)
+  );
+
 export default function Home() {
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState(0);
@@ -92,6 +125,7 @@ export default function Home() {
   const [leftmostNote, setLeftmostNote] = useState("");
   const [rightmostNote, setRightmostNote] = useState("");
   const [draggingCorner, setDraggingCorner] = useState<CornerKey | null>(null);
+  const [calibrationSummary, setCalibrationSummary] = useState<CalibrationSummary | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cropContainerRef = useRef<HTMLDivElement>(null);
@@ -104,9 +138,11 @@ export default function Home() {
     const handleMove = (e: MouseEvent) => {
       const container = cropContainerRef.current;
       if (!container) return;
+      // rect is the padded stage, not the frame, so convert through
+      // toFrameCoord -- corners stay stored in frame-normalized units.
       const rect = container.getBoundingClientRect();
-      const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
-      const y = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+      const x = toFrameCoord((e.clientX - rect.left) / rect.width);
+      const y = toFrameCoord((e.clientY - rect.top) / rect.height);
       setCorners((prev) => ({ ...prev, [draggingCorner]: { x, y } }));
     };
     const handleUp = () => setDraggingCorner(null);
@@ -142,6 +178,7 @@ export default function Home() {
     setCorners(DEFAULT_CORNERS);
     setLeftmostNote("");
     setRightmostNote("");
+    setCalibrationSummary(null);
   };
 
   // Extracts a single preview frame from a locally-selected video file,
@@ -236,6 +273,7 @@ export default function Home() {
     setTempoBpm(null);
     setRawNotes([]);
     setEvents([]);
+    setCalibrationSummary(null);
     setProgress(0);
 
     // Simulated progress while the real upload happens in the background.
@@ -267,6 +305,38 @@ export default function Home() {
       // Pickup-measure UI stays interactive, but the backend doesn't support
       // it yet -- has_pickup/pickup_beats are intentionally not sent.
 
+      // Keyboard calibration. Corners go as SOURCE VIDEO PIXELS, never
+      // displayed-element pixels: the preview is scaled to fit the card (and
+      // now letterboxed inside a padded stage too), so anything measured
+      // against the rendered element would be off by the display scale.
+      // `corners` is stored normalized to the extracted frame, and
+      // previewFrameWidth/Height are that frame's natural dimensions
+      // (canvas.width = video.videoWidth), so this multiplication lands in
+      // exactly the pixel space OpenCV sees server-side. Values outside
+      // [0,width] are expected and correct for keybeds that run off-frame.
+      // Sent as one JSON field because calibration is all-or-nothing.
+      if (previewFrameWidth > 0 && previewFrameHeight > 0 && leftmostNote && rightmostNote) {
+        const toSourcePixels = (corner: Corner): [number, number] => [
+          corner.x * previewFrameWidth,
+          corner.y * previewFrameHeight,
+        ];
+        formData.append(
+          "calibration",
+          JSON.stringify({
+            frame_width: previewFrameWidth,
+            frame_height: previewFrameHeight,
+            leftmost_note: leftmostNote,
+            rightmost_note: rightmostNote,
+            corners: {
+              front_left: toSourcePixels(corners.frontLeft),
+              front_right: toSourcePixels(corners.frontRight),
+              back_left: toSourcePixels(corners.backLeft),
+              back_right: toSourcePixels(corners.backRight),
+            },
+          })
+        );
+      }
+
       const response = await fetch(`${API_BASE}/api/transcribe`, {
         method: "POST",
         body: formData,
@@ -295,6 +365,7 @@ export default function Home() {
         setTempoBpm(data.tempo_bpm);
         setRawNotes(Array.isArray(data.raw_notes) ? data.raw_notes : []);
         setEvents(Array.isArray(data.events) ? data.events : []);
+        setCalibrationSummary(data.calibration ?? null);
       }, 600);
     } catch (err) {
       if (progressIntervalRef.current) {
@@ -305,7 +376,17 @@ export default function Home() {
         err instanceof Error ? err.message : "Something went wrong while uploading."
       );
     }
-  }, [timeSignatureMode, simpleMeter, compoundMeter, tempoBpmInput]);
+  }, [
+    timeSignatureMode,
+    simpleMeter,
+    compoundMeter,
+    tempoBpmInput,
+    corners,
+    previewFrameWidth,
+    previewFrameHeight,
+    leftmostNote,
+    rightmostNote,
+  ]);
 
   const handleDrop = useCallback(
     (e: React.DragEvent<HTMLDivElement>) => {
@@ -413,6 +494,36 @@ export default function Home() {
                 </a>
               </div>
             </div>
+
+            {calibrationSummary && (
+              <div className="rounded-2xl border border-gray-800 bg-gray-900 p-6 shadow-lg shadow-black/40">
+                <h2 className="text-lg font-semibold text-white">Keyboard Calibration</h2>
+                <p className="mt-1 text-sm text-gray-400">
+                  Accepted by the backend and reported back for verification. It does not
+                  affect note detection.
+                </p>
+                <dl className="mt-4 space-y-1 text-sm">
+                  <div className="flex justify-between rounded-lg bg-gray-800/60 px-3 py-2">
+                    <dt className="text-gray-400">Calibrated range</dt>
+                    <dd className="font-medium text-indigo-400">
+                      {calibrationSummary.leftmost_note} – {calibrationSummary.rightmost_note}
+                    </dd>
+                  </div>
+                  <div className="flex justify-between rounded-lg bg-gray-800/60 px-3 py-2">
+                    <dt className="text-gray-400">Keys mapped</dt>
+                    <dd className="font-medium text-indigo-400">
+                      {calibrationSummary.key_count} ({calibrationSummary.white_key_count} white)
+                    </dd>
+                  </div>
+                  <div className="flex justify-between rounded-lg bg-gray-800/60 px-3 py-2">
+                    <dt className="text-gray-400">Frame</dt>
+                    <dd className="font-medium text-indigo-400">
+                      {calibrationSummary.frame_width}×{calibrationSummary.frame_height}px
+                    </dd>
+                  </div>
+                </dl>
+              </div>
+            )}
 
             <div className="rounded-2xl border border-gray-800 bg-gray-900 p-6 shadow-lg shadow-black/40">
               <h2 className="text-lg font-semibold text-white">Detected Events</h2>
@@ -742,23 +853,34 @@ export default function Home() {
             <p className="mt-1 text-xs text-gray-500">
               Drag the four corner handles onto the keybed&apos;s actual front-left, front-right,
               back-left, and back-right corners, then tell us which notes are visible there.
+              If the keyboard runs past the edge of the video, drag the handles out into the
+              grey margin — corners outside the frame are expected and are sent correctly.
             </p>
 
             {frameExtractionError && (
               <p className="mt-3 text-sm text-red-600">{frameExtractionError}</p>
             )}
 
-            {previewFrameUrl && (
+            {previewFrameUrl && previewFrameWidth > 0 && previewFrameHeight > 0 && (
               <div
                 ref={cropContainerRef}
-                className="relative mt-4 w-full touch-none select-none overflow-hidden rounded-xl"
+                className="relative mt-4 w-full touch-none select-none rounded-xl bg-gray-100 ring-1 ring-gray-200 ring-inset"
+                // Stage spans HANDLE_SPAN frame-widths by HANDLE_SPAN
+                // frame-heights, so its aspect ratio is still the frame's.
+                style={{ aspectRatio: `${previewFrameWidth} / ${previewFrameHeight}` }}
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={previewFrameUrl}
                   alt="Video preview frame"
-                  className="block h-auto w-full"
+                  className="absolute block ring-1 ring-gray-400/60"
                   draggable={false}
+                  style={{
+                    left: `${toStagePercent(0)}%`,
+                    top: `${toStagePercent(0)}%`,
+                    width: `${(1 / HANDLE_SPAN) * 100}%`,
+                    height: `${(1 / HANDLE_SPAN) * 100}%`,
+                  }}
                 />
                 <svg
                   className="pointer-events-none absolute inset-0 h-full w-full"
@@ -766,7 +888,7 @@ export default function Home() {
                   viewBox="0 0 100 100"
                 >
                   <polygon
-                    points={`${corners.frontLeft.x * 100},${corners.frontLeft.y * 100} ${corners.frontRight.x * 100},${corners.frontRight.y * 100} ${corners.backRight.x * 100},${corners.backRight.y * 100} ${corners.backLeft.x * 100},${corners.backLeft.y * 100}`}
+                    points={`${toStagePercent(corners.frontLeft.x)},${toStagePercent(corners.frontLeft.y)} ${toStagePercent(corners.frontRight.x)},${toStagePercent(corners.frontRight.y)} ${toStagePercent(corners.backRight.x)},${toStagePercent(corners.backRight.y)} ${toStagePercent(corners.backLeft.x)},${toStagePercent(corners.backLeft.y)}`}
                     fill="rgba(99,102,241,0.15)"
                     stroke="rgb(99,102,241)"
                     strokeWidth="0.5"
@@ -782,7 +904,10 @@ export default function Home() {
                     }}
                     title={label}
                     className="absolute -ml-2 -mt-2 h-4 w-4 cursor-grab rounded-full border-2 border-white bg-indigo-500 shadow active:cursor-grabbing"
-                    style={{ left: `${corners[key].x * 100}%`, top: `${corners[key].y * 100}%` }}
+                    style={{
+                      left: `${toStagePercent(corners[key].x)}%`,
+                      top: `${toStagePercent(corners[key].y)}%`,
+                    }}
                   />
                 ))}
               </div>

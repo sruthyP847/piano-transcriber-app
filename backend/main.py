@@ -1,3 +1,4 @@
+import json
 import math
 import uuid
 from pathlib import Path
@@ -1200,11 +1201,197 @@ def read_hello():
     return {"message": "Hello World"}
 
 
+# --- Calibration intake (Stage 2.75) ---
+#
+# The frontend has always captured 4 keybed corners and a leftmost/rightmost
+# note range and then thrown them away. Everything downstream therefore had to
+# *infer* the absolute octave anchor from finger spacing, which is a weak
+# constraint and produced a confirmed ~80mm (tritone) lateral offset on
+# chords-notes-mix.mp4 that invalidated a whole session of measurements
+# (PROJECT_STATE §3 item 15). A user-supplied note range removes that
+# inference entirely, so it is worth strict validation here: a calibration
+# that is silently wrong is far more damaging than one that is rejected.
+#
+# Sent as a single JSON field rather than ~12 flat Form fields on purpose --
+# calibration is all-or-nothing, and one field can only be present or absent,
+# whereas separate fields admit partially-populated states that would each
+# need their own ambiguous failure handling.
+
+# Both guards are in source-frame px^2 and sit orders of magnitude below any
+# real calibration (a genuine keybed quad is ~10^4-10^5 px^2).
+CALIBRATION_MIN_QUAD_AREA_PX = 100.0
+CALIBRATION_MIN_TRIANGLE_AREA_PX = 25.0
+CALIBRATION_CORNER_NAMES = ("front_left", "front_right", "back_left", "back_right")
+
+
+def _video_frame_size(video_path: Path) -> tuple[int, int] | None:
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        return (width, height) if width > 0 and height > 0 else None
+    finally:
+        cap.release()
+
+
+def _triangle_area(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> float:
+    return abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) / 2.0
+
+
+def parse_calibration_payload(payload: str, video_path: Path) -> dict:
+    """Validate the frontend's calibration blob, returning corner tuples and
+    note names ready for build_keyboard_calibration.
+
+    Raises HTTPException(400) with a specific message for every rejection --
+    the alternative is an opaque cv2 error from a singular homography, or
+    worse, a plausible-looking result that is quietly misprojected.
+    """
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"calibration is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="calibration must be a JSON object.")
+
+    raw_corners = data.get("corners")
+    if not isinstance(raw_corners, dict):
+        raise HTTPException(status_code=400, detail="calibration.corners is missing or not an object.")
+
+    corners: dict[str, tuple[float, float]] = {}
+    for name in CALIBRATION_CORNER_NAMES:
+        point = raw_corners.get(name)
+        # bool is a subclass of int, so exclude it explicitly rather than
+        # letting `true` silently become the coordinate 1.
+        if (
+            not isinstance(point, (list, tuple))
+            or len(point) != 2
+            or not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                for v in point
+            )
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"calibration.corners.{name} must be an [x, y] pair of finite numbers.",
+            )
+        corners[name] = (float(point[0]), float(point[1]))
+
+    leftmost = data.get("leftmost_note")
+    rightmost = data.get("rightmost_note")
+    if not isinstance(leftmost, str) or not isinstance(rightmost, str):
+        raise HTTPException(
+            status_code=400,
+            detail="calibration.leftmost_note and calibration.rightmost_note are required strings.",
+        )
+    midis = {}
+    for label, name in (("leftmost_note", leftmost), ("rightmost_note", rightmost)):
+        try:
+            midis[label] = note_name_to_midi(name)
+        except (ValueError, KeyError, IndexError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"calibration.{label} {name!r} is not a valid note name (expected e.g. 'C4', 'A#3').",
+            ) from exc
+    if midis["rightmost_note"] <= midis["leftmost_note"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"calibration.rightmost_note ({rightmost}) must be higher than "
+                f"calibration.leftmost_note ({leftmost})."
+            ),
+        )
+
+    # Corners are in the source frame's own pixel space. If the client measured
+    # against a differently-sized frame, every projected point is wrong by that
+    # scale factor -- exactly the class of silent systematic offset that caused
+    # the tritone bug -- so refuse rather than guess.
+    frame_width = data.get("frame_width")
+    frame_height = data.get("frame_height")
+    if frame_width is not None and frame_height is not None:
+        actual = _video_frame_size(video_path)
+        if actual is not None and (int(frame_width), int(frame_height)) != actual:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"calibration frame size {int(frame_width)}x{int(frame_height)} does not match "
+                    f"the uploaded video's actual {actual[0]}x{actual[1]}."
+                ),
+            )
+
+    # Degenerate geometry check. cv2.getPerspectiveTransform is singular when
+    # any three of the four points are collinear, which a plain "are the points
+    # distinct?" test would miss entirely.
+    quad = [corners[n] for n in ("front_left", "front_right", "back_right", "back_left")]
+    shoelace = sum(
+        quad[i][0] * quad[(i + 1) % 4][1] - quad[(i + 1) % 4][0] * quad[i][1] for i in range(4)
+    )
+    quad_area = abs(shoelace) / 2.0
+    if quad_area < CALIBRATION_MIN_QUAD_AREA_PX:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"calibration corners are degenerate: quadrilateral area {quad_area:.1f}px^2 is too "
+                "small (corners are coincident or collinear)."
+            ),
+        )
+    for i in range(4):
+        for j in range(i + 1, 4):
+            for k in range(j + 1, 4):
+                if _triangle_area(quad[i], quad[j], quad[k]) < CALIBRATION_MIN_TRIANGLE_AREA_PX:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "calibration corners are degenerate: three corners are collinear, which "
+                            "makes the perspective transform singular."
+                        ),
+                    )
+
+    return {"corners": corners, "leftmost_note": leftmost, "rightmost_note": rightmost}
+
+
+def build_calibration_summary(
+    keyboard_calibration: dict,
+    leftmost_note: str,
+    rightmost_note: str,
+    frame_size: tuple[int, int] | None,
+) -> dict:
+    """JSON-safe view of a calibration. Deliberately excludes the closures
+    (pixel_to_note / pixel_to_canonical) the calibration dict also carries."""
+    keys = keyboard_calibration["keys"]
+    u_low, u_high = keyboard_calibration["u_bounds"]
+    ordered = sorted(keys.items(), key=lambda item: item[1]["midi"])
+    return {
+        "leftmost_note": leftmost_note,
+        "rightmost_note": rightmost_note,
+        "frame_width": frame_size[0] if frame_size else None,
+        "frame_height": frame_size[1] if frame_size else None,
+        "u_bounds": [round(u_low, 4), round(u_high, 4)],
+        "key_count": len(keys),
+        "white_key_count": sum(1 for info in keys.values() if info["is_white"]),
+        "white_key_width_mm": WHITE_KEY_WIDTH_MM,
+        "keys": [
+            {
+                "note": name,
+                "midi": info["midi"],
+                "is_white": info["is_white"],
+                "u_center": round(info["u_center"], 4),
+                "center_px": [round(info["center_px"][0], 2), round(info["center_px"][1], 2)],
+                "corners_px": [[round(x, 2), round(y, 2)] for x, y in info["corners_px"]],
+            }
+            for name, info in ordered
+        ],
+    }
+
+
 @app.post("/api/transcribe")
 async def transcribe(
     file: UploadFile,
     time_signature: str | None = Form(None),
     tempo_bpm: float | None = Form(None),
+    # Optional, and must stay optional: every caller without calibration data
+    # (including the pipeline's own regression fixtures) has to keep working
+    # byte-identically. When absent, nothing below touches the analysis at all.
+    calibration: str | None = Form(None),
 ):
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
@@ -1249,6 +1436,33 @@ async def transcribe(
         if video_clip is not None:
             video_clip.close()
 
+    # Built before the (expensive) analysis so a bad calibration fails fast.
+    # NOTE: this only *builds and reports* the calibration -- it deliberately
+    # does not influence note detection, filtering, or confidences in any way.
+    # Applying it to the notes (proximity vetoing) is a separate decision.
+    calibration_summary = None
+    if calibration is not None:
+        spec = parse_calibration_payload(calibration, destination)
+        try:
+            keyboard_calibration = build_keyboard_calibration(
+                spec["leftmost_note"],
+                spec["rightmost_note"],
+                spec["corners"]["front_left"],
+                spec["corners"]["front_right"],
+                spec["corners"]["back_left"],
+                spec["corners"]["back_right"],
+            )
+        except (ValueError, cv2.error) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Could not build keyboard calibration: {exc}"
+            ) from exc
+        calibration_summary = build_calibration_summary(
+            keyboard_calibration,
+            spec["leftmost_note"],
+            spec["rightmost_note"],
+            _video_frame_size(destination),
+        )
+
     audio_analysis = analyze_audio(
         audio_destination,
         destination,
@@ -1265,7 +1479,7 @@ async def transcribe(
     )
     generate_placeholder_musicxml(UPLOAD_DIR / musicxml_filename)
 
-    return {
+    response = {
         "status": "success",
         "message": "File ingested and audio extracted successfully.",
         "original_filename": file.filename,
@@ -1277,3 +1491,8 @@ async def transcribe(
         "musicxml_url": f"{BASE_URL}/api/uploads/{musicxml_filename}",
         **audio_analysis,
     }
+    # Added only when calibration was supplied, so the no-calibration response
+    # keeps exactly the shape it has today rather than gaining a null field.
+    if calibration_summary is not None:
+        response["calibration"] = calibration_summary
+    return response
