@@ -406,6 +406,54 @@ def tonic_to_lilypond(tonic: str) -> str:
     return pitch
 
 
+def _full_measure_rest_token(bar_size_sixteenths: int) -> str:
+    """A whole bar of silence is one full-measure rest -- LilyPond's R, not r.
+
+    Deliberately NOT combined with LilyPond's multi-measure compression
+    (\\compressMMRests), which collapses several empty bars into one symbol
+    with a count above it. That is right for a single-staff part but wrong
+    here: on a PianoStaff the other hand is usually still playing, and
+    compressing one staff would desynchronise the two.
+    """
+    code = NOTATION_VALUE_TO_CODE.get(bar_size_sixteenths)
+    if code is not None:
+        return f"R{code}"
+    # Bars that aren't a single standard value (9/8 = 18 sixteenths, 12/8 = 24)
+    # use LilyPond's scaled form, e.g. R1*9/8.
+    divisor = math.gcd(bar_size_sixteenths, NOTATION_BAR_SIZE)
+    return f"R1*{bar_size_sixteenths // divisor}/{NOTATION_BAR_SIZE // divisor}"
+
+
+def _spell_rests(start: int, length: int, bar_length_beats: float) -> list[str]:
+    """Spell a stretch of silence as the fewest, largest rests that fit.
+
+    Silence follows the same beat-respecting rules as notes (via spell_rhythm:
+    no value crosses a bar line, and a value starting off-beat can't swallow
+    the next beat boundary), plus one convention notes don't have -- a bar
+    silent from its first sixteenth to its last is a single full-measure rest.
+
+    The caller must pass ONE contiguous span of silence. Spelling each silent
+    event separately is exactly the bug this replaced: adjacent silences never
+    merged, so an empty 4/4 bar came out as four quarter rests, or as thirty
+    eighth rests across an empty staff.
+    """
+    bar_size = round(bar_length_beats * NOTATION_SIXTEENTHS_PER_BEAT)
+    tokens: list[str] = []
+    position = start
+    remaining = length
+    while remaining > 0:
+        bar_start = (position // bar_size) * bar_size
+        chunk = min(remaining, bar_start + bar_size - position)
+        if position == bar_start and chunk == bar_size:
+            tokens.append(_full_measure_rest_token(bar_size))
+        else:
+            for value, _tied in spell_rhythm(position, chunk, bar_length_beats):
+                tokens.append(f"r{NOTATION_VALUE_TO_CODE[value]}")
+        position += chunk
+        remaining -= chunk
+    return tokens
+
+
 def _build_staff_input(
     events: list[dict],
     is_treble: bool,
@@ -414,9 +462,11 @@ def _build_staff_input(
     letter_accidentals: dict[str, int] | None = None,
     prefer_flats: bool = False,
 ) -> str:
-    tokens: list[str] = []
+    # Pass 1 -- work out which spans carry notes ON THIS STAFF. The accept/skip
+    # rule below depends only on event start/end, never on pitch, so both
+    # staves walk an identical timeline and no note can shift between them.
+    filled: list[tuple[int, int, str]] = []
     position = 0
-
     for event in events:
         absolute_beat = (event["bar"] - 1) * bar_length_beats + event["beat_in_bar"]
         start = round(absolute_beat * NOTATION_SIXTEENTHS_PER_BEAT)
@@ -425,14 +475,9 @@ def _build_staff_input(
         # A note can't be notated with zero duration, so floor it to a
         # sixteenth rather than silently dropping it.
         duration_beats = max(event["duration_beats"], 0.25)
-        duration_sixteenths = round(duration_beats * NOTATION_SIXTEENTHS_PER_BEAT)
-        end = start + duration_sixteenths
+        end = start + round(duration_beats * NOTATION_SIXTEENTHS_PER_BEAT)
 
-        if start > position:
-            for value, _tied in spell_rhythm(position, start - position, bar_length_beats):
-                tokens.append(f"r{NOTATION_VALUE_TO_CODE[value]}")
-            position = start
-        elif start < position:
+        if start < position:
             # Quantization collapsed this event earlier than where the previous
             # event already filled to -- nothing sensible to notate, skip it.
             continue
@@ -452,26 +497,31 @@ def _build_staff_input(
             for note in event["notes"]
             if (note_name_to_midi(note["note"]) >= 60) == is_treble
         ]
-
-        pieces = spell_rhythm(position, end - position, bar_length_beats)
         if pitches:
             # Multiple notes on one staff (e.g. two notes in different octaves
             # both landing treble) render as a normal simultaneous chord.
             pitch_str = pitches[0] if len(pitches) == 1 else "<" + " ".join(pitches) + ">"
-            for value, tied in pieces:
-                tie = "~" if tied else ""
-                tokens.append(f"{pitch_str}{NOTATION_VALUE_TO_CODE[value]}{tie}")
-        else:
-            for value, _tied in pieces:
-                tokens.append(f"r{NOTATION_VALUE_TO_CODE[value]}")
+            filled.append((start, end, pitch_str))
+        position = end
+
+    # Pass 2 -- emit. Everything between two notes on this staff is one
+    # contiguous silence, however many events it spans, so it consolidates.
+    tokens: list[str] = []
+    position = 0
+    for start, end, pitch_str in filled:
+        if start > position:
+            tokens.extend(_spell_rests(position, start - position, bar_length_beats))
+        for value, tied in spell_rhythm(start, end - start, bar_length_beats):
+            tie = "~" if tied else ""
+            tokens.append(f"{pitch_str}{NOTATION_VALUE_TO_CODE[value]}{tie}")
         position = end
 
     if total_sixteenths > position:
-        for value, _tied in spell_rhythm(position, total_sixteenths - position, bar_length_beats):
-            tokens.append(f"r{NOTATION_VALUE_TO_CODE[value]}")
-        position = total_sixteenths
+        tokens.extend(_spell_rests(position, total_sixteenths - position, bar_length_beats))
 
-    return " ".join(tokens) if tokens else f"r{NOTATION_VALUE_TO_CODE[NOTATION_BAR_SIZE]}"
+    return " ".join(tokens) if tokens else _full_measure_rest_token(
+        round(bar_length_beats * NOTATION_SIXTEENTHS_PER_BEAT)
+    )
 
 
 def generate_notation_pdf(
